@@ -14,6 +14,11 @@ static obs_output_t *FailCreateOutput(const char *, const char *, obs_data_t *, 
 #define obs_output_create FailCreateOutput
 #include "../src/push-widget.cpp"
 #undef obs_output_create
+#include "../src/platform/tiktok-session.h"
+#include "../src/tiktok/streamlabs-client.h"
+#include "../src/tiktok/auth-manager.h"
+#include "../src/tiktok/cleanup.h"
+#include "../src/tiktok/worker.h"
 
 namespace {
 std::atomic<int> starts{0}, ends{0};
@@ -53,7 +58,10 @@ bool StreamlabsTikTokClient::EndStream(const std::string &, std::string *, TikTo
     std::cerr << "FAIL line " << __LINE__ << ": " #condition "\n"; return false; } } while (0)
 
 struct TikTokLifecycleTest {
-    using Remote = PushWidgetImpl::TikTokSessionState;
+    using Remote = TikTokPlatformSession::State;
+    static TikTokPlatformSession *Session(PushWidgetImpl *widget) {
+        return dynamic_cast<TikTokPlatformSession *>(widget->platformSession_.get());
+    }
     using Local = PushWidgetImpl::RestreamState;
     template<class Predicate> static bool wait(Predicate predicate) {
         QElapsedTimer elapsed; elapsed.start();
@@ -74,8 +82,8 @@ struct TikTokLifecycleTest {
         // No OBS output or encoders: creation is independent. Rapid clicks
         // must submit only one request, even before completion reaches the UI.
         holdStart = true;
-        CHECK(widget->BeginEndpointRequest(client));
-        CHECK(!widget->BeginEndpointRequest(client));
+        CHECK(Session(widget.get())->BeginEndpointRequest(client));
+        CHECK(!Session(widget.get())->BeginEndpointRequest(client));
         CHECK(wait([] { return startEntered.load(); }));
         CHECK(widget->output_ == nullptr);
         CHECK(starts == 1);
@@ -83,24 +91,24 @@ struct TikTokLifecycleTest {
         config->syncStop = true;
         widget->OnOBSEvent(OBS_FRONTEND_EVENT_STREAMING_STOPPING);
         CHECK(!widget->startRestreamWhenReady_);
-        CHECK(widget->tiktokSession_.state == Remote::CreatingEndpoint);
+        CHECK(Session(widget.get())->tiktokSession_.state == Remote::CreatingEndpoint);
         config->syncStop = false;
         holdStart = false;
-        CHECK(wait([&] { return widget->tiktokSession_.HasEndpoint(); }));
-        CHECK(widget->tiktokSession_.state == Remote::EndpointReady);
+        CHECK(wait([&] { return Session(widget.get())->tiktokSession_.HasEndpoint(); }));
+        CHECK(Session(widget.get())->tiktokSession_.state == Remote::EndpointReady);
         CHECK(widget->output_ == nullptr);
-        CHECK(widget->tiktokSession_.streamKey == "FAKE-KEY");
+        CHECK(Session(widget.get())->tiktokSession_.streamKey == "FAKE-KEY");
         CHECK(config->serviceParam.find("key") == config->serviceParam.end());
 
         // Missing OBS output implementation and repeated local retries preserve
         // the endpoint and never submit another remote creation request.
         widget->StartStreaming();
         CHECK(widget->restreamState_ == Local::Stopped);
-        CHECK(widget->tiktokSession_.state == Remote::EndpointReady);
+        CHECK(Session(widget.get())->tiktokSession_.state == Remote::EndpointReady);
         widget->StartStreaming();
         CHECK(starts == 1 && ends == 0);
         widget->StopStreaming();
-        CHECK(widget->tiktokSession_.HasEndpoint() && ends == 0);
+        CHECK(Session(widget.get())->tiktokSession_.HasEndpoint() && ends == 0);
         const int beforeConnectingStop = outputAttempts;
         widget->restreamState_ = Local::Connecting;
         widget->StartStop();
@@ -108,7 +116,7 @@ struct TikTokLifecycleTest {
         CHECK(outputAttempts == beforeConnectingStop);
         widget->OnStopped(OBS_OUTPUT_CONNECT_FAILED);
         QCoreApplication::processEvents();
-        CHECK(widget->tiktokSession_.state == Remote::EndpointReady && ends == 0);
+        CHECK(Session(widget.get())->tiktokSession_.state == Remote::EndpointReady && ends == 0);
 
         // Queued callbacks must not update a replacement output or dead widget.
         widget->OnStarted();
@@ -116,33 +124,33 @@ struct TikTokLifecycleTest {
         QCoreApplication::processEvents();
         CHECK(widget->restreamState_ == Local::Stopped);
         widget->OnStarted();
-        widget->ShutdownTikTokIntegration();
+        widget->ShutdownPlatformIntegration();
         CHECK(wait([] { return ends.load() == 1; }));
-        CHECK(!widget->tiktokSession_.HasEndpoint());
+        CHECK(!Session(widget.get())->tiktokSession_.HasEndpoint());
         widget.reset();
         QCoreApplication::processEvents();
         CHECK(ends == 1);
 
         // Explicit End guards overlap; a failed End retains credentials for retry.
         widget = std::make_unique<PushWidgetImpl>("test", nullptr);
-        CHECK(widget->BeginEndpointRequest(client));
-        CHECK(wait([&] { return widget->tiktokSession_.HasEndpoint(); }));
+        CHECK(Session(widget.get())->BeginEndpointRequest(client));
+        CHECK(wait([&] { return Session(widget.get())->tiktokSession_.HasEndpoint(); }));
         failEnd = true;
-        widget->EndTikTokEndpoint(); widget->EndTikTokEndpoint();
-        CHECK(wait([&] { return widget->tiktokSession_.state == Remote::EndpointReady; }));
+        widget->EndPlatformEndpoint(); widget->EndPlatformEndpoint();
+        CHECK(wait([&] { return Session(widget.get())->tiktokSession_.state == Remote::EndpointReady; }));
         CHECK(ends == 2);
-        CHECK(widget->tiktokSession_.HasEndpoint());
+        CHECK(Session(widget.get())->tiktokSession_.HasEndpoint());
         failEnd = false;
-        widget->EndTikTokEndpoint(); widget->EndTikTokEndpoint();
-        CHECK(wait([&] { return widget->tiktokSession_.state == Remote::Idle; }));
-        CHECK(ends == 3 && !widget->tiktokSession_.HasEndpoint());
-        CHECK(widget->tiktokSession_.streamKey.empty() && !widget->tiktokSession_.client);
+        widget->EndPlatformEndpoint(); widget->EndPlatformEndpoint();
+        CHECK(wait([&] { return Session(widget.get())->tiktokSession_.state == Remote::Idle; }));
+        CHECK(ends == 3 && !Session(widget.get())->tiktokSession_.HasEndpoint());
+        CHECK(Session(widget.get())->tiktokSession_.streamKey.empty() && !Session(widget.get())->tiktokSession_.client);
         widget.reset();
 
         // Closing the owner during /start must safely end the unadopted result.
         holdStart = true; startEntered = false;
         widget = std::make_unique<PushWidgetImpl>("test", nullptr);
-        CHECK(widget->BeginEndpointRequest(client));
+        CHECK(Session(widget.get())->BeginEndpointRequest(client));
         CHECK(wait([] { return startEntered.load(); }));
         widget.reset(); holdStart = false;
         CHECK(wait([] { return ends.load() == 4; }));
@@ -151,10 +159,10 @@ struct TikTokLifecycleTest {
         // End requested while creation is in flight waits for its result.
         holdStart = true; startEntered = false;
         widget = std::make_unique<PushWidgetImpl>("test", nullptr);
-        CHECK(widget->BeginEndpointRequest(client));
+        CHECK(Session(widget.get())->BeginEndpointRequest(client));
         CHECK(wait([] { return startEntered.load(); }));
-        widget->EndTikTokEndpoint(); holdStart = false;
-        CHECK(wait([&] { return widget->tiktokSession_.state == Remote::Idle; }));
+        widget->EndPlatformEndpoint(); holdStart = false;
+        CHECK(wait([&] { return Session(widget.get())->tiktokSession_.state == Remote::Idle; }));
         CHECK(ends == 5);
         widget.reset();
         CHECK(wait([] { return !TikTokLiveRegistry::hasActiveActivity(); }));
@@ -162,17 +170,17 @@ struct TikTokLifecycleTest {
         // A confirmed missing remote stream clears credentials. An invalid
         // token is a remote error and must prevent local restart.
         widget = std::make_unique<PushWidgetImpl>("test", nullptr);
-        CHECK(widget->BeginEndpointRequest(client));
-        CHECK(wait([&] { return widget->tiktokSession_.HasEndpoint(); }));
+        CHECK(Session(widget.get())->BeginEndpointRequest(client));
+        CHECK(wait([&] { return Session(widget.get())->tiktokSession_.HasEndpoint(); }));
         endFailure = TikTokFailure::Auth;
-        widget->EndTikTokEndpoint();
-        CHECK(wait([&] { return widget->tiktokSession_.state == Remote::Error; }));
+        widget->EndPlatformEndpoint();
+        CHECK(wait([&] { return Session(widget.get())->tiktokSession_.state == Remote::Error; }));
         widget->StartStreaming();
         CHECK(widget->restreamState_ == Local::Stopped);
-        CHECK(widget->tiktokSession_.HasEndpoint());
+        CHECK(Session(widget.get())->tiktokSession_.HasEndpoint());
         endFailure = TikTokFailure::NotFound;
-        widget->EndTikTokEndpoint();
-        CHECK(wait([&] { return widget->tiktokSession_.state == Remote::Idle; }));
+        widget->EndPlatformEndpoint();
+        CHECK(wait([&] { return Session(widget.get())->tiktokSession_.state == Remote::Idle; }));
         CHECK(ends == 7);
         widget.reset(); endFailure = TikTokFailure::None;
 
@@ -180,9 +188,9 @@ struct TikTokLifecycleTest {
         // repeated Start. There is no lookup-by-request API to reconcile it.
         widget = std::make_unique<PushWidgetImpl>("test", nullptr);
         startFailure = TikTokFailure::Timeout;
-        CHECK(widget->BeginEndpointRequest(client));
-        CHECK(wait([&] { return widget->tiktokSession_.state == Remote::Error; }));
-        CHECK(widget->endpointCreationUncertain_);
+        CHECK(Session(widget.get())->BeginEndpointRequest(client));
+        CHECK(wait([&] { return Session(widget.get())->tiktokSession_.state == Remote::Error; }));
+        CHECK(Session(widget.get())->endpointCreationUncertain_);
         const int beforeRetry = starts;
         widget->StartStreaming(); widget->StartStreaming();
         CHECK(starts == beforeRetry);
@@ -288,14 +296,14 @@ struct TikTokLifecycleTest {
         widget->isStarting_ = true;
         widget->startRestreamWhenReady_ = true;
         holdStart = true; startEntered = false;
-        CHECK(widget->BeginEndpointRequest(client));
+        CHECK(Session(widget.get())->BeginEndpointRequest(client));
         widget->SetEnabled(false);
         CHECK(!widget->startRestreamWhenReady_);
         holdStart = false;
-        CHECK(wait([&] { return widget->tiktokSession_.HasEndpoint(); }));
+        CHECK(wait([&] { return Session(widget.get())->tiktokSession_.HasEndpoint(); }));
         QCoreApplication::processEvents();
         CHECK(!widget->isStarting_);
-        CHECK(widget->tiktokSession_.HasEndpoint());
+        CHECK(Session(widget.get())->tiktokSession_.HasEndpoint());
         widget->SetEnabled(true);
         const int startsBeforeGuard = starts.load();
         const int attemptsBeforeGuard = outputAttempts;
@@ -308,8 +316,8 @@ struct TikTokLifecycleTest {
         CHECK(!widget->isStarting_);
         CHECK(widget->restreamState_ == Local::Stopped);
         CHECK(starts.load() == startsBeforeGuard);
-        widget->EndTikTokEndpoint();
-        CHECK(wait([&] { return widget->tiktokSession_.state == Remote::Idle; }));
+        widget->EndPlatformEndpoint();
+        CHECK(wait([&] { return Session(widget.get())->tiktokSession_.state == Remote::Idle; }));
         widget.reset();
 
         // Preflight blocks automatic endpoint creation on a broken local
@@ -326,14 +334,14 @@ struct TikTokLifecycleTest {
         widget->StartStreaming();
         QCoreApplication::processEvents();
         CHECK(starts.load() == startsBeforePreflight);
-        CHECK(!widget->tiktokSession_.HasEndpoint());
-        CHECK(widget->tiktokSession_.state == Remote::Idle);
+        CHECK(!Session(widget.get())->tiktokSession_.HasEndpoint());
+        CHECK(Session(widget.get())->tiktokSession_.state == Remote::Idle);
         CHECK(!widget->isStarting_);
         // ...but an explicit endpoint request still works without encoders.
-        CHECK(widget->BeginEndpointRequest(client));
-        CHECK(wait([&] { return widget->tiktokSession_.HasEndpoint(); }));
-        widget->EndTikTokEndpoint();
-        CHECK(wait([&] { return widget->tiktokSession_.state == Remote::Idle; }));
+        CHECK(Session(widget.get())->BeginEndpointRequest(client));
+        CHECK(wait([&] { return Session(widget.get())->tiktokSession_.HasEndpoint(); }));
+        widget->EndPlatformEndpoint();
+        CHECK(wait([&] { return Session(widget.get())->tiktokSession_.state == Remote::Idle; }));
         config->videoConfig.reset();
         widget.reset();
 
@@ -392,7 +400,7 @@ struct TikTokLifecycleTest {
         // Owner disappears after worker completion, before UI adoption.
         startFinished = false;
         widget = std::make_unique<PushWidgetImpl>("test", nullptr);
-        CHECK(widget->BeginEndpointRequest(client));
+        CHECK(Session(widget.get())->BeginEndpointRequest(client));
         QElapsedTimer timeout; timeout.start();
         while (!startFinished && timeout.elapsed() < 5000) QThread::msleep(1);
         CHECK(startFinished);
@@ -407,10 +415,10 @@ struct TikTokLifecycleTest {
 
         // Explicit End failure after owner destruction balances the registry.
         widget = std::make_unique<PushWidgetImpl>("test", nullptr);
-        CHECK(widget->BeginEndpointRequest(client));
-        CHECK(wait([&] { return widget->tiktokSession_.HasEndpoint(); }));
+        CHECK(Session(widget.get())->BeginEndpointRequest(client));
+        CHECK(wait([&] { return Session(widget.get())->tiktokSession_.HasEndpoint(); }));
         failEnd = true;
-        widget->EndTikTokEndpoint(); widget.reset();
+        widget->EndPlatformEndpoint(); widget.reset();
         CHECK(wait([] { return ends.load() == 11; }));
         CHECK(wait([] { return !TikTokLiveRegistry::hasActiveActivity(); }));
         failEnd = false;
@@ -419,7 +427,7 @@ struct TikTokLifecycleTest {
         // and ends a successful creation that was never adopted by the UI.
         startFinished = false;
         widget = std::make_unique<PushWidgetImpl>("test", nullptr);
-        CHECK(widget->BeginEndpointRequest(client));
+        CHECK(Session(widget.get())->BeginEndpointRequest(client));
         timeout.restart();
         while (!startFinished && timeout.elapsed() < 5000) QThread::msleep(1);
         CHECK(startFinished);

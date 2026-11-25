@@ -2,10 +2,7 @@
 #include "output-config.h"
 #include "json-util.hpp"
 #include "obs.hpp"
-#include "streamlabs-tiktok.h"
-#include "tiktok/auth-manager.h"
-#include "tiktok/streamlabs-client.h"
-#include "tiktok/worker.h"
+#include "platform/platform-provider.h"
 #include <QMenu>
 #include <QTabWidget>
 #include <qevent.h>
@@ -173,10 +170,10 @@ class EditTargetPanelImpl: public EditTargetPanel
     QTabWidget* outputSettingsTabs_ = nullptr;
 
     // True when the panel opened a target with no saved encoder choice at
-    // all (i.e. a brand-new target). Only such targets get the independent
-    // TikTok preset; existing saved choices are never rewritten here.
+    // all (i.e. a brand-new target). Only such targets get a provider's
+    // independent preset; existing saved choices are never rewritten here.
     bool freshTarget_ = false;
-    bool tiktokPresetApplied_ = false;
+    bool platformPresetApplied_ = false;
 
     QLineEdit* name_ = 0;
 
@@ -280,16 +277,7 @@ class EditTargetPanelImpl: public EditTargetPanel
     QCheckBox* syncStart_ = 0;
     QCheckBox *syncStop_ = 0;
 
-    QCheckBox* tiktokEnable_ = 0;
-    QLabel* tiktokAuthStatus_ = 0;
-    QPushButton* tiktokLoginButton_ = 0;
-    QPushButton* tiktokLogoutButton_ = 0;
-    QPushButton* tiktokApplyButton_ = 0;
-    QLineEdit* tiktokTitle_ = 0;
-    QComboBox* tiktokCategory_ = 0;
-    QComboBox* tiktokAudience_ = 0;
-    QTimer* tiktokCategoryDebounce_ = 0;
-    uint64_t tiktokCategoryGen_ = 0;
+    std::vector<PlatformTargetEditor*> platformEditors_;
 
     std::vector<std::string> EnumEncodersByCodec(const char* codec)
     {
@@ -485,12 +473,7 @@ class EditTargetPanelImpl: public EditTargetPanel
     }
 
 public:
-    ~EditTargetPanelImpl() override
-    {
-        // Orphan in-flight category searches: their completions are
-        // dropped while workers finish harmlessly on pool threads.
-        TikTokWorkerService::instance().cancelReceiver(this);
-    }
+    ~EditTargetPanelImpl() override = default;
 
     void FillModeBox(QComboBox *box)
     {
@@ -635,61 +618,20 @@ public:
             page->setLayout(layout);
             topTabs_->addTab(WrapInScroll(page), obs_module_text("Tab.Audio"));
         }
-        // ---- TikTok ----
-        {
-            auto page = new QWidget(this);
-            auto tiktokLayout = new QGridLayout(page);
-            tiktokLayout->setColumnStretch(1, 1);
-            tiktokLayout->addWidget(tiktokEnable_ = new QCheckBox(obs_module_text("TikTok.Enable"), page), 0, 0, 1, 3);
-            tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Status"), page), 1, 0);
-            tiktokLayout->addWidget(tiktokAuthStatus_ = new QLabel(page), 1, 1);
-            tiktokAuthStatus_->setWordWrap(true);
-            tiktokLayout->addWidget(tiktokApplyButton_ = new QPushButton(obs_module_text("TikTok.ApplyAccess"), page), 1, 2);
-            QObject::connect(tiktokApplyButton_, &QPushButton::clicked, [this]() {
-                TikTokAuthManager::instance().openLiveAccessApplication(this);
+        // ---- Platform integrations ----
+        for (auto *provider : PlatformProviders()) {
+            if (!provider)
+                continue;
+            auto *editor = provider->CreateTargetEditor(config_, this);
+            if (!editor)
+                continue;
+            editor->SetEnabledChangedCallback([this]() {
+                SaveConfig();
+                LoadConfig();
+                UpdateUI();
             });
-            tiktokLayout->addWidget(tiktokLoginButton_ = new QPushButton(obs_module_text("TikTok.Login"), page), 2, 0);
-            tiktokLayout->addWidget(tiktokLogoutButton_ = new QPushButton(obs_module_text("TikTok.Logout"), page), 2, 1, 1, 2);
-            QObject::connect(tiktokLoginButton_, &QPushButton::clicked, [this]() {
-                TikTokAuthManager::instance().login(this);
-            });
-            QObject::connect(tiktokLogoutButton_, &QPushButton::clicked, [this]() {
-                TikTokAuthManager::instance().logout(this);
-            });
-            tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Title"), page), 3, 0);
-            tiktokLayout->addWidget(tiktokTitle_ = new QLineEdit("", page), 3, 1, 1, 2);
-            tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Category"), page), 4, 0);
-            tiktokLayout->addWidget(tiktokCategory_ = new QComboBox(page), 4, 1, 1, 2);
-            tiktokCategory_->setEditable(true);
-            tiktokCategory_->setInsertPolicy(QComboBox::NoInsert);
-            tiktokCategoryDebounce_ = new QTimer(this);
-            tiktokCategoryDebounce_->setSingleShot(true);
-            QObject::connect(tiktokCategory_->lineEdit(), &QLineEdit::textEdited, [this]() {
-                tiktokCategoryDebounce_->start(400);
-            });
-            QObject::connect(tiktokCategoryDebounce_, &QTimer::timeout, [this]() {
-                RunTikTokCategorySearch();
-            });
-            tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Audience"), page), 5, 0);
-            tiktokLayout->addWidget(tiktokAudience_ = new QComboBox(page), 5, 1, 1, 2);
-            tiktokAudience_->addItem(obs_module_text("TikTok.AudienceEveryone"), "0");
-            tiktokAudience_->addItem(obs_module_text("TikTok.AudienceAdult"), "1");
-            page->setLayout(tiktokLayout);
-            QObject::connect(&TikTokAuthManager::instance(), &TikTokAuthManager::authenticationChanged,
-                             this, [this]() { UpdateTikTokAuth(); });
-            QObject::connect(&TikTokAuthManager::instance(), &TikTokAuthManager::loginFailed,
-                             this, [this](const QString &message) {
-                                 if (message.isEmpty() ||
-                                     message == QString::fromUtf8(obs_module_text("TikTok.LoginCancelled")))
-                                     return;
-                                 QMessageBox::warning(this,
-                                     QString::fromUtf8(obs_module_text("TikTok.Settings")), message);
-                             });
-            UpdateTikTokAuth();
-            TikTokAuthManager::instance().refreshAccessState();
-            // Keep auth controls reachable: a stretch row swallows extra height.
-            tiktokLayout->setRowStretch(6, 1);
-            topTabs_->addTab(WrapInScroll(page), obs_module_text("Tab.TikTok"));
+            platformEditors_.push_back(editor);
+            topTabs_->addTab(WrapInScroll(editor), provider->TargetTabTitle());
         }
         // ---- Avanzado ----
         {
@@ -756,11 +698,6 @@ public:
             updateOutputTab();
         });
 
-        QObject::connect(tiktokEnable_, &QCheckBox::toggled, [this]() {
-            SaveConfig();
-            LoadConfig();
-            UpdateUI();
-        });
     }
 
     void LoadProtocols()
@@ -1114,12 +1051,8 @@ public:
             config_->protocol = tostdu8(protocolSelector_->itemData(protocolSelector_->currentIndex()).toString());
         config_->syncStart = syncStart_->isChecked();
         config_->syncStop = syncStop_->isChecked();
-        config_->tiktok.enabled = tiktokEnable_->isChecked();
-        config_->tiktok.title = tostdu8(tiktokTitle_->text());
-        config_->tiktok.category = tostdu8(tiktokCategory_->currentText());
-        config_->tiktok.audience = (tiktokAudience_->currentData().toString() == QStringLiteral("1"))
-                                       ? TikTokAudience::AdultOnly
-                                       : TikTokAudience::Everyone;
+        for (auto *editor : platformEditors_)
+            editor->Save(*config_);
         if (outputSettings_)
             config_->outputParam = outputSettings_->Save();
         if (serviceSettings_)
@@ -1179,96 +1112,8 @@ public:
         protocolSelector_->setCurrentIndex(protocolIndex);
         syncStart_->setChecked(target.syncStart);
         syncStop_->setChecked(target.syncStop);
-        tiktokEnable_->setChecked(target.tiktok.enabled);
-        tiktokTitle_->setText(QString::fromUtf8(target.tiktok.title));
-        tiktokCategory_->blockSignals(true);
-        tiktokCategory_->clear();
-        if (!target.tiktok.category.empty())
-            tiktokCategory_->addItem(QString::fromUtf8(target.tiktok.category));
-        tiktokCategory_->setEditText(QString::fromUtf8(target.tiktok.category));
-        tiktokCategory_->blockSignals(false);
-        const int audienceIndex =
-            tiktokAudience_->findData(target.tiktok.matureContent() ? "1" : "0");
-        tiktokAudience_->setCurrentIndex(audienceIndex < 0 ? 0 : audienceIndex);
-    }
-
-    void UpdateTikTokAuth()
-    {
-        if (!tiktokAuthStatus_ || !tiktokLoginButton_ || !tiktokLogoutButton_ || !tiktokApplyButton_)
-            return;
-        auto &auth = TikTokAuthManager::instance();
-        tiktokAuthStatus_->setText(auth.statusText());
-        const bool authenticated = auth.isAuthenticated();
-        const auto status = auth.status();
-        const bool busy = status == TikTokAuthManager::Status::LoggingIn ||
-                          status == TikTokAuthManager::Status::Validating;
-        tiktokLoginButton_->setVisible(!authenticated);
-        tiktokLogoutButton_->setVisible(authenticated);
-        tiktokLoginButton_->setEnabled(!busy);
-        tiktokLogoutButton_->setEnabled(!busy);
-        // The application page needs a TikTok login and is pointless
-        // once access is granted: authenticated but not granted only.
-        tiktokApplyButton_->setVisible(authenticated && !auth.isLiveAccessGranted());
-        tiktokApplyButton_->setEnabled(!busy);
-    }
-
-    void RunTikTokCategorySearch()
-    {
-        auto client = TikTokAuthManager::instance().client();
-        if (!client || !tiktokCategory_)
-            return;
-        const std::string query = tostdu8(tiktokCategory_->currentText());
-        if (query.size() < 2)
-            return;
-        const uint64_t gen = ++tiktokCategoryGen_;
-        auto result = std::make_shared<TikTokCategoryListResult>();
-        // Managed job: no raw this crosses threads. Destroying the
-        // dialog orphans the job (completion dropped); the generation
-        // check covers superseded searches.
-        TikTokWorkerService::instance().submit(
-            this,
-            [client, query, result](const std::shared_ptr<TikTokJobContext> &) {
-                *result = client->SearchCategories(query);
-            },
-            [result, gen, epoch = client->authEpoch()](const std::shared_ptr<TikTokJobContext> &job) {
-                // dynamic_cast: QObject is a virtual base of QWidget, so
-                // static_cast cannot downcast here.
-                auto *self = dynamic_cast<EditTargetPanelImpl *>(job->receiver.data());
-                if (self == nullptr)
-                    return;
-                self->ApplyTikTokCategories(gen, *result, epoch);
-            },
-            false);
-    }
-
-    void ApplyTikTokCategories(uint64_t gen, const TikTokCategoryListResult &result, uint64_t epoch)
-    {
-        if (gen != tiktokCategoryGen_ || !tiktokCategory_)
-            return;
-        if (!result.success) {
-            switch (ClassifyCredentialResult(result)) {
-            case CredentialValidation::InvalidCredential:
-                TikTokAuthManager::instance().handleAuthFailure(epoch);
-                break;
-            case CredentialValidation::ValidLiveForbidden:
-                TikTokAuthManager::instance().noteLiveAccessDenied(epoch);
-                break;
-            default:
-                break;
-            }
-            return;
-        }
-        const QString current = tiktokCategory_->currentText();
-        tiktokCategory_->blockSignals(true);
-        tiktokCategory_->clear();
-        for (const auto &entry : result.categories) {
-            tiktokCategory_->addItem(QString::fromUtf8(entry.fullName),
-                                     QString::fromUtf8(entry.gameMaskId));
-        }
-        tiktokCategory_->setEditText(current);
-        tiktokCategory_->blockSignals(false);
-        if (!result.categories.empty() && tiktokCategory_->hasFocus())
-            tiktokCategory_->showPopup();
+        for (auto *editor : platformEditors_)
+            editor->Load(target);
     }
 
     void LoadVideoConfig(VideoEncoderConfig *pconfig) {
@@ -1398,18 +1243,18 @@ public:
         return fallback;
     }
 
-    // For a brand-new TikTok target still on shared-encoder selections,
-    // default to independent H.264 video + AAC audio so it can stream
+    // For a brand-new platform target still on shared-encoder selections,
+    // default to the provider's independent encoder preset so it can stream
     // without OBS's primary output. Only Share selections are touched.
-    void ApplyTikTokIndependentPreset()
+    void ApplyPlatformIndependentPreset(const PlatformEncoderPreset &preset)
     {
-        tiktokPresetApplied_ = true;
+        platformPresetApplied_ = true;
         auto modeData = [](QComboBox *box) {
             return box->currentData().toString().toStdString();
         };
         if (modeData(videoMode_) == OBS_STREAMING_ENC_PLACEHOLDER ||
             modeData(videoMode_) == OBS_RECORDING_ENC_PLACEHOLDER) {
-            int idx = PickIndependentEncoder(venc_, "h264", "obs_x264");
+            int idx = PickIndependentEncoder(venc_, preset.videoCodec, preset.videoEncoderId);
             if (idx >= 0) {
                 videoMode_->setCurrentIndex(videoMode_->findData("custom"));
                 venc_->setCurrentIndex(idx);
@@ -1418,7 +1263,7 @@ public:
         }
         if (modeData(audioMode_) == OBS_STREAMING_ENC_PLACEHOLDER ||
             modeData(audioMode_) == OBS_RECORDING_ENC_PLACEHOLDER) {
-            int idx = PickIndependentEncoder(aenc_, "aac", "ffmpeg_aac");
+            int idx = PickIndependentEncoder(aenc_, preset.audioCodec, preset.audioEncoderId);
             if (idx >= 0) {
                 audioMode_->setCurrentIndex(audioMode_->findData("custom"));
                 aenc_->setCurrentIndex(idx);
@@ -1466,8 +1311,12 @@ public:
             LoadAudioConfig(it ? it.get() : nullptr);
         }
 
-        if (freshTarget_ && !tiktokPresetApplied_ && config_->tiktok.enabled)
-            ApplyTikTokIndependentPreset();
+        if (freshTarget_ && !platformPresetApplied_) {
+            if (auto *provider = PlatformProviderForTarget(*config_)) {
+                if (auto preset = provider->IndependentEncoderPreset(*config_))
+                    ApplyPlatformIndependentPreset(*preset);
+            }
+        }
 
         UpdateUI();
     }

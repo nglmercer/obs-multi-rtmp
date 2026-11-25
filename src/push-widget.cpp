@@ -15,11 +15,7 @@
 #include "encoder-source.h"
 #include "output-config.h"
 #include "protocols.h"
-#include "streamlabs-tiktok.h"
-#include "tiktok/auth-manager.h"
-#include "tiktok/cleanup.h"
-#include "tiktok/streamlabs-client.h"
-#include "tiktok/worker.h"
+#include "platform/platform-provider.h"
 
 #include "obs.hpp"
 
@@ -332,26 +328,18 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     obs_hotkey_id startHotkeyId_ = OBS_INVALID_HOTKEY_ID;
     obs_hotkey_id stopHotkeyId_ = OBS_INVALID_HOTKEY_ID;
 
-    // Remote resources are independent from the local OBS output. UI thread only.
-    enum class TikTokSessionState { Idle, Authenticating, CreatingEndpoint,
-                                    EndpointReady, EndingEndpoint, Error };
-    struct TikTokSession {
-        TikTokSessionState state = TikTokSessionState::Idle;
-        std::string streamId, server, streamKey;
-        std::shared_ptr<StreamlabsTikTokClient> client;
-        bool HasEndpoint() const
-        { return !streamId.empty() && !server.empty() && !streamKey.empty(); }
-        void Reset() { *this = TikTokSession{}; }
-    } tiktokSession_;
+    // Remote platform resources are independent from the local OBS output.
+    // The provider owns its own worker lifecycle; this widget owns only the
+    // local restream state and the deferred-start flags below.
+    PlatformProvider* platformProvider_ = nullptr;
+    std::unique_ptr<PlatformSession> platformSession_;
     enum class RestreamState { Stopped, Preparing, Connecting, Streaming, Stopping };
     RestreamState restreamState_ = RestreamState::Stopped;
-    uint64_t tiktokRequestGen_ = 0;
     std::atomic<uint64_t> outputGeneration_{0};
     friend struct TikTokLifecycleTest;
     friend struct StandaloneTest;
     bool startRestreamWhenReady_ = false;
     bool endAfterStop_ = false;
-    bool endpointCreationUncertain_ = false;
     QPushButton *create_live_btn_ = nullptr;
     QPushButton *end_live_btn_ = nullptr;
 
@@ -372,7 +360,7 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         }
 
         OBSDataAutoRelease conf = obs_data_create_from_json(config_->serviceParam.dump().c_str());
-        if (conf && config_->tiktok.enabled) {
+        if (conf && platformProvider_ && platformProvider_->IsTargetEnabled(*config_)) {
             obs_data_set_string(conf, "server", server.c_str());
             obs_data_set_string(conf, "key", streamKey.c_str());
         }
@@ -472,247 +460,77 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     }
 
 
-    const char *TikTokFailureText(TikTokFailure failure, bool resolvingCategory)
+    PlatformSession::Callbacks PlatformCallbacks()
     {
-        switch (failure) {
-        case TikTokFailure::Auth:
-        case TikTokFailure::Forbidden:
-            return obs_module_text("Error.TikTokAuth");
-        case TikTokFailure::RateLimited:
-            return obs_module_text("Error.TikTokRateLimit");
-        case TikTokFailure::Network:
-        case TikTokFailure::Timeout:
-            return obs_module_text("Error.TikTokNetwork");
-        case TikTokFailure::None:
-        case TikTokFailure::BadRequest:
-        case TikTokFailure::NotFound:
-        case TikTokFailure::Server:
-        case TikTokFailure::InvalidResponse:
-        default:
-            return resolvingCategory ? obs_module_text("Error.TikTokCategory")
-                                     : obs_module_text("Error.TikTokCreateLive");
-        }
-    }
-
-    void ShowTikTokError(const char *prefix, const std::string &detail)
-    {
-        QString msg = QString::fromUtf8(prefix);
-        // API details are displayed only, never sent to normal logs.
-        if (!detail.empty())
-            msg += "\n" + QString::fromUtf8(detail.c_str());
-        SetMsg(msg);
-    }
-
-    // Ends a LIVE exactly once via a managed cleanup job. liveCounted
-    // must be true iff TikTokLiveRegistry::addLive() was called for this
-    // id (stored sessions); stranded ids were never counted. Safe from
-    // any thread; logout stays blocked until the job finishes, and
-    // module unload joins it.
-    static void SubmitTikTokCleanup(std::shared_ptr<StreamlabsTikTokClient> client, std::string streamId,
-                                    bool liveCounted)
-    {
-        if (!client || streamId.empty())
-            return;
-        if (!GlobalCleanupLedger().claim(streamId))
-            return;
-        auto runEnd = [client, streamId, liveCounted]() {
-            TikTokNetworkCancel cleanupScope(nullptr);
-            std::string error;
-            if (!client->EndStream(streamId, &error))
-                blog(LOG_WARNING, TAG "[TikTokStream] Failed to end remote endpoint");
-            else
-                blog(LOG_INFO, TAG "TikTok LIVE session ended.");
-            if (liveCounted)
-                TikTokLiveRegistry::removeLive();
+        return PlatformSession::Callbacks{
+            [this](const QString &message) { SetMsg(message); },
+            [this]() { UpdatePlatformActions(); UpdateStatusDot(); },
+            [this]() { OnPlatformEndpointReady(); },
+            [this]() { UpdatePlatformActions(); UpdateStatusDot(); },
+            [this]() { StopRestream(); },
+            [this]() { OnPlatformStartCancelled(); },
         };
-        auto job = TikTokWorkerService::instance().submit(
-            nullptr,
-            [runEnd](const std::shared_ptr<TikTokJobContext> &) { runEnd(); },
-            TikTokWorkerService::Done(), true, true);
-        if (!job) {
-            // Shutdown already joining: finish synchronously in place.
-            // Still safe: unload cannot return while this runs.
-            runEnd();
+    }
+
+    void EnsurePlatformSession()
+    {
+        auto *provider = PlatformProviderForTarget(*config_);
+        if (!provider)
+            return;
+        if (platformProvider_ && platformProvider_ != provider && platformSession_) {
+            platformSession_->CancelPendingWork();
+            platformSession_->Shutdown();
+            platformSession_.reset();
+        }
+        platformProvider_ = provider;
+        if (create_live_btn_)
+            create_live_btn_->setText(platformProvider_->CreateEndpointText());
+        if (end_live_btn_)
+            end_live_btn_->setText(platformProvider_->EndEndpointText());
+        if (!platformSession_) {
+            platformSession_ = platformProvider_->CreateSession(
+                config_, PlatformCallbacks(), this);
+        } else {
+            platformSession_->UpdateConfig(config_);
         }
     }
 
-    bool CreateTikTokEndpoint()
+    bool PlatformIntegrationEnabled() const
     {
-        if (endpointCreationUncertain_) {
-            startRestreamWhenReady_ = false;
-            SetMsg(obs_module_text("TikTok.CreationUncertain"));
-            return false;
-        }
-        if (tiktokSession_.HasEndpoint() ||
-            tiktokSession_.state == TikTokSessionState::CreatingEndpoint ||
-            tiktokSession_.state == TikTokSessionState::EndingEndpoint ||
-            tiktokSession_.state == TikTokSessionState::Authenticating)
-            return false;
-        if (config_->protocol != "RTMP") {
-            SetMsg(obs_module_text("Error.TikTokRequiresRTMP"));
-            return false;
-        }
-        auto client = TikTokAuthManager::instance().client();
-        if (!client || !TikTokAuthManager::instance().isAuthenticated()) {
-            tiktokSession_.state = TikTokSessionState::Authenticating;
-            SetMsg(obs_module_text("TikTok.LoggingIn"));
-            TikTokAuthManager::instance().login(this);
-            return false;
-        }
-        return BeginEndpointRequest(std::move(client));
+        return platformProvider_ && platformProvider_->IsTargetEnabled(*config_);
     }
 
-    bool BeginEndpointRequest(std::shared_ptr<StreamlabsTikTokClient> client)
+    bool PlatformHasEndpoint() const
     {
-        if (tiktokSession_.HasEndpoint() ||
-            tiktokSession_.state == TikTokSessionState::CreatingEndpoint ||
-            tiktokSession_.state == TikTokSessionState::EndingEndpoint)
-            return false;
-        const std::string title = config_->tiktok.title;
-        const std::string category = config_->tiktok.category;
-        const TikTokAudience audience = config_->tiktok.audience;
-        struct Prepared {
-            TikTokCategoryResult category;
-            TikTokStartResult start;
-            std::shared_ptr<StreamlabsTikTokClient> client;
-            bool adopted = false;
-            ~Prepared()
-            {
-                // Covers destruction/shutdown after Work finishes but
-                // before the queued Done callback adopts the endpoint.
-                if (start.success && !adopted)
-                    SubmitTikTokCleanup(client, start.streamId, false);
-            }
-        };
-        auto outcome = std::make_shared<Prepared>();
-        outcome->client = client;
-        const auto gen = ++tiktokRequestGen_;
-        tiktokSession_.state = TikTokSessionState::CreatingEndpoint;
-        SetMsg(obs_module_text("TikTok.Preparing"));
-        blog(LOG_INFO, TAG "[TikTokStream] Creating remote endpoint");
-
-        // Managed job: no raw this crosses threads. If the widget dies,
-        // the worker finishes safely and ends any LIVE it created; the
-        // generation check drops superseded results.
-        auto job = TikTokWorkerService::instance().submit(
-            this,
-            [client, title, category, audience, outcome](const std::shared_ptr<TikTokJobContext> &job) {
-                outcome->category = client->ResolveCategory(category);
-                if (outcome->category.success && !job->cancelled.load(std::memory_order_relaxed)) {
-                    outcome->start =
-                        client->StartStream(title, outcome->category.categoryId, audience);
-                }
-            },
-            [client, outcome, gen](const std::shared_ptr<TikTokJobContext> &job) {
-                // dynamic_cast: QObject is a virtual base of QWidget, so
-                // static_cast cannot downcast here.
-                auto *self = dynamic_cast<PushWidgetImpl *>(job->receiver.data());
-                if (self == nullptr)
-                    return;
-                outcome->adopted = true;
-                self->OnTikTokPrepared(gen, client, outcome->category, outcome->start);
-            },
-            true);
-        if (!job) {
-            blog(LOG_WARNING, TAG "TikTok preparation rejected during shutdown for '%s'.",
-                 config_->name.c_str());
-            tiktokSession_.state = TikTokSessionState::Error;
-            startRestreamWhenReady_ = false;
-            return false;
-        }
-        return true;
+        return platformSession_ && platformSession_->HasEndpoint();
     }
 
-    // UI-thread continuation of endpoint creation.
-    void OnTikTokPrepared(uint64_t gen, std::shared_ptr<StreamlabsTikTokClient> client,
-                          const TikTokCategoryResult &categoryResult, const TikTokStartResult &startResult)
+    void OnPlatformEndpointReady()
     {
-        if (gen != tiktokRequestGen_ ||
-            tiktokSession_.state != TikTokSessionState::CreatingEndpoint) {
-            if (startResult.success)
-                SubmitTikTokCleanup(client, startResult.streamId, false);
-            return;
-        }
-
-        if (!categoryResult.success) {
-            {
-                tiktokSession_.state = TikTokSessionState::Error;
-                startRestreamWhenReady_ = false;
-                endAfterStop_ = false;
-                isStarting_ = false;
-            }
-            switch (ClassifyCredentialResult(categoryResult)) {
-            case CredentialValidation::InvalidCredential:
-                TikTokAuthManager::instance().handleAuthFailure(client->authEpoch());
-                break;
-            case CredentialValidation::ValidLiveForbidden:
-                TikTokAuthManager::instance().noteLiveAccessDenied(client->authEpoch());
-                break;
-            default:
-                break;
-            }
-            blog(LOG_WARNING, TAG "TikTok category lookup failed for '%s'.", config_->name.c_str());
-            ShowTikTokError(TikTokFailureText(categoryResult.failure, true), categoryResult.error);
-            return;
-        }
-        if (!config_->tiktok.category.empty() && !categoryResult.matchedExact)
-            blog(LOG_INFO, TAG "TikTok category '%s' not found, streaming under Other.",
-                 config_->tiktok.category.c_str());
-
-        if (!startResult.success) {
-            {
-                tiktokSession_.state = TikTokSessionState::Error;
-                startRestreamWhenReady_ = false;
-                endAfterStop_ = false;
-                isStarting_ = false;
-            }
-            switch (ClassifyCredentialResult(startResult)) {
-            case CredentialValidation::InvalidCredential:
-                TikTokAuthManager::instance().handleAuthFailure(client->authEpoch());
-                break;
-            case CredentialValidation::ValidLiveForbidden:
-                TikTokAuthManager::instance().noteLiveAccessDenied(client->authEpoch());
-                break;
-            default:
-                break;
-            }
-            endpointCreationUncertain_ = startResult.failure == TikTokFailure::Network ||
-                startResult.failure == TikTokFailure::Timeout || startResult.failure == TikTokFailure::Server ||
-                startResult.failure == TikTokFailure::InvalidResponse;
-            blog(LOG_WARNING, TAG "TikTok LIVE creation failed for '%s'.", config_->name.c_str());
-            ShowTikTokError(TikTokFailureText(startResult.failure, false), startResult.error);
-            if (endpointCreationUncertain_) SetMsg(obs_module_text("TikTok.CreationUncertain"));
-            return;
-        }
-
-        tiktokSession_.streamId = startResult.streamId;
-        tiktokSession_.server = startResult.server;
-        tiktokSession_.streamKey = startResult.key;
-        tiktokSession_.client = client;
-        tiktokSession_.state = TikTokSessionState::EndpointReady;
-        TikTokLiveRegistry::addLive();
-        TikTokAuthManager::instance().noteLiveStartSucceeded(client->authEpoch());
-        blog(LOG_INFO, TAG "[TikTokStream] Endpoint created");
-        SetMsg(obs_module_text("TikTok.EndpointReady"));
         if (endAfterStop_) {
             endAfterStop_ = false;
-            // No local start follows the requested End: release the guard.
             isStarting_ = false;
-            EndTikTokEndpoint();
+            EndPlatformEndpoint();
             return;
         }
         if (startRestreamWhenReady_) {
             startRestreamWhenReady_ = false;
             StartRestream();
         } else {
-            // The deferred start was cancelled (stop/disable) while creation
-            // was in flight: the endpoint is preserved but no local output
-            // follows, so the starting guard must be released here.
             isStarting_ = false;
         }
+        UpdatePlatformActions();
     }
 
-    void EndTikTokEndpoint()
+    void OnPlatformStartCancelled()
+    {
+        startRestreamWhenReady_ = false;
+        endAfterStop_ = false;
+        isStarting_ = false;
+        UpdatePlatformActions();
+    }
+
+    void EndPlatformEndpoint()
     {
         startRestreamWhenReady_ = false;
         if (restreamState_ != RestreamState::Stopped || IsRunning()) {
@@ -720,87 +538,20 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             StopRestream();
             return;
         }
-        if (tiktokSession_.state == TikTokSessionState::EndingEndpoint)
-            return;
-        if (tiktokSession_.state == TikTokSessionState::CreatingEndpoint) {
-            // Retain the generation until completion; end the resulting endpoint.
-            endAfterStop_ = true;
-            return;
-        }
-        if (!tiktokSession_.HasEndpoint()) {
-            if (endpointCreationUncertain_) {
-                // There is no stream id to end or query. Let the user
-                // resolve the uncertain creation on TikTok before retrying.
-                const auto answer = QMessageBox::question(this,
-                    obs_module_text("TikTok.EndLive"), obs_module_text("TikTok.ResolveUncertain"));
-                if (answer != QMessageBox::Yes) return;
-                endpointCreationUncertain_ = false;
-            }
-            tiktokSession_.Reset();
-            SetMsg(obs_module_text("TikTok.EndpointEnded"));
-            return;
-        }
-        tiktokSession_.state = TikTokSessionState::EndingEndpoint;
-        SetMsg(obs_module_text("TikTok.EndingEndpoint"));
-        blog(LOG_INFO, TAG "[TikTokStream] Ending remote endpoint");
-        const auto gen = ++tiktokRequestGen_;
-        auto client = tiktokSession_.client;
-        auto id = tiktokSession_.streamId;
-        struct EndOutcome {
-            bool success = false;
-            TikTokFailure failure = TikTokFailure::None;
-            bool retained = false;
-            ~EndOutcome() {
-                // If the owner disappears, no retry is possible. Keep
-                // registry accounting balanced after the final attempt.
-                if (!success && !retained) TikTokLiveRegistry::removeLive();
-            }
-        };
-        auto outcome = std::make_shared<EndOutcome>();
-        auto job = TikTokWorkerService::instance().submit(this,
-            [client, id, outcome](const std::shared_ptr<TikTokJobContext> &) {
-                outcome->success = client->EndStream(id, nullptr, &outcome->failure);
-                // A missing remote stream no longer owns a reusable endpoint.
-                if (outcome->failure == TikTokFailure::NotFound) outcome->success = true;
-                if (outcome->success) TikTokLiveRegistry::removeLive();
-                else blog(LOG_WARNING, TAG "[TikTokStream] Remote end failed; retry available while owner exists");
-            },
-            [gen, client, outcome](const std::shared_ptr<TikTokJobContext> &job) {
-                auto *self = dynamic_cast<PushWidgetImpl *>(job->receiver.data());
-                if (!self || gen != self->tiktokRequestGen_) return;
-                if (outcome->success) {
-                    self->tiktokSession_.Reset();
-                    self->SetMsg(obs_module_text("TikTok.EndpointEnded"));
-                    blog(LOG_INFO, TAG "[TikTokStream] Remote endpoint ended");
-                } else {
-                    outcome->retained = true;
-                    self->tiktokSession_.state = outcome->failure == TikTokFailure::Auth ?
-                        TikTokSessionState::Error : TikTokSessionState::EndpointReady;
-                    if (outcome->failure == TikTokFailure::Auth)
-                        TikTokAuthManager::instance().handleAuthFailure(client->authEpoch());
-                    self->SetMsg(obs_module_text("Error.TikTokEndLive"));
-                }
-            }, true, true);
-        if (!job) {
-            outcome->retained = true;
-            tiktokSession_.state = TikTokSessionState::EndpointReady;
-            SetMsg(obs_module_text("Error.TikTokEndLive"));
-        }
+        if (platformSession_)
+            platformSession_->EndEndpoint();
     }
 
-    void ShutdownTikTokIntegration()
+    void ShutdownPlatformIntegration()
     {
-        ++tiktokRequestGen_;
+        if (platformSession_)
+            platformSession_->CancelPendingWork();
         startRestreamWhenReady_ = false;
         endAfterStop_ = false;
-        endpointCreationUncertain_ = false;
-        TikTokWorkerService::instance().cancelReceiver(this);
         ForceReleaseObsOutput();
         isBusy_ = false;
-        if (tiktokSession_.HasEndpoint() &&
-            tiktokSession_.state != TikTokSessionState::EndingEndpoint)
-            SubmitTikTokCleanup(tiktokSession_.client, tiktokSession_.streamId, true);
-        tiktokSession_.Reset();
+        if (platformSession_)
+            platformSession_->Shutdown();
         QCoreApplication::removePostedEvents(this, QEvent::MetaCall);
     }
 
@@ -1498,41 +1249,23 @@ public:
         msg_->setWordWrap(true);
         msg_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
 
-        create_live_btn_ = new QPushButton(obs_module_text("TikTok.CreateEndpoint"), this);
-        end_live_btn_ = new QPushButton(obs_module_text("TikTok.EndLive"), this);
+        platformProvider_ = PlatformProviderForTarget(*config_);
+        create_live_btn_ = new QPushButton(
+            platformProvider_ ? platformProvider_->CreateEndpointText() : QString(), this);
+        end_live_btn_ = new QPushButton(
+            platformProvider_ ? platformProvider_->EndEndpointText() : QString(), this);
         layout->addWidget(create_live_btn_, 2, 0, 1, 2);
         layout->addWidget(end_live_btn_, 2, 2);
-        QObject::connect(create_live_btn_, &QPushButton::clicked, this, [this]() { CreateTikTokEndpoint(); });
-        QObject::connect(end_live_btn_, &QPushButton::clicked, this, [this]() { EndTikTokEndpoint(); });
-        auto &auth = TikTokAuthManager::instance();
-        QObject::connect(&auth, &TikTokAuthManager::stateChanged, this, [this]() {
-            if (tiktokSession_.HasEndpoint() &&
-                tiktokSession_.state != TikTokSessionState::EndingEndpoint &&
-                TikTokAuthManager::instance().status() == TikTokAuthManager::Status::SessionExpired) {
-                tiktokSession_.state = TikTokSessionState::Error;
-                StopRestream();
-                SetMsg(obs_module_text("TikTok.SessionExpired"));
-            }
+        QObject::connect(create_live_btn_, &QPushButton::clicked, this, [this]() {
+            EnsurePlatformSession();
+            if (platformSession_)
+                platformSession_->CreateEndpoint();
         });
-        QObject::connect(&auth, &TikTokAuthManager::loginSucceeded, this, [this]() {
-            if (tiktokSession_.state == TikTokSessionState::Authenticating) {
-                tiktokSession_.state = TikTokSessionState::Idle;
-                CreateTikTokEndpoint();
-                // Same rule as StartStreaming(): keep the guard only while
-                // async creation work is actually in flight.
-                if (tiktokSession_.state != TikTokSessionState::CreatingEndpoint &&
-                    tiktokSession_.state != TikTokSessionState::Authenticating)
-                    isStarting_ = false;
-            }
+        QObject::connect(end_live_btn_, &QPushButton::clicked, this, [this]() {
+            EndPlatformEndpoint();
         });
-        QObject::connect(&auth, &TikTokAuthManager::loginFailed, this, [this](const QString &error) {
-            if (tiktokSession_.state == TikTokSessionState::Authenticating) {
-                tiktokSession_.state = TikTokSessionState::Error;
-                startRestreamWhenReady_ = false;
-                isStarting_ = false;
-                SetMsg(error);
-            }
-        });
+        if (platformProvider_)
+            EnsurePlatformSession();
         setLayout(layout);
 
         LoadConfig();
@@ -1565,10 +1298,10 @@ public:
 
     ~PushWidgetImpl()
     {
-        // Orphan in-flight jobs before teardown: their completions are
-        // dropped while their workers finish safely on pool threads.
-        // ReleaseObsOutput() runs inside ShutdownTikTokIntegration().
-        ShutdownTikTokIntegration();
+        // Orphan in-flight provider jobs before teardown: their completions
+        // are dropped while workers finish safely on pool threads.
+        // ReleaseObsOutput() runs inside ShutdownPlatformIntegration().
+        ShutdownPlatformIntegration();
         if (startHotkeyId_ != OBS_INVALID_HOTKEY_ID)
             obs_hotkey_unregister(startHotkeyId_);
         if (stopHotkeyId_ != OBS_INVALID_HOTKEY_ID)
@@ -1778,8 +1511,8 @@ public:
             return;
         }
         // Re-entry guard (upstream crash fix): StartStreaming() re-entry
-        // during connection used to crash. The flag stays set across the
-        // async TikTok endpoint creation below; terminal states (OnStarted,
+        // during connection used to crash. The flag stays set across async
+        // provider endpoint creation below; terminal states (OnStarted,
         // OnStopped, endpoint/auth failure, RestreamFailed) clear it.
         bool expected = false;
         if (IsBusy() || !isStarting_.compare_exchange_strong(expected, true))
@@ -1787,9 +1520,10 @@ public:
         auto resetStarting = finally([this] { isStarting_ = false; });
 
         if (endAfterStop_ || restreamState_ != RestreamState::Stopped) return;
-        if (config_->tiktok.enabled && !tiktokSession_.HasEndpoint()) {
+        EnsurePlatformSession();
+        if (PlatformIntegrationEnabled() && (!platformSession_ || !platformSession_->HasEndpoint())) {
             // Preflight first: a broken local configuration must not mint
-            // a remote LIVE that can never be fed. The manual Create
+            // a remote endpoint that can never be fed. The manual Create
             // Endpoint button skips this on purpose.
             if (const char* preflight = ValidateLocalEncoderConfiguration()) {
                 blog(LOG_WARNING, TAG "Local preflight failed for '%s' (%s); no endpoint created",
@@ -1799,12 +1533,15 @@ public:
                 SetMsg(obs_module_text(preflight));
                 return;
             }
+            if (!platformSession_) {
+                SetMsg(obs_module_text("Error.StartOutput"));
+                return;
+            }
             startRestreamWhenReady_ = true;
-            CreateTikTokEndpoint();
+            platformSession_->CreateEndpoint();
             // Keep the guard only while async work is actually in flight
             // (endpoint creation or login); otherwise release it.
-            if (tiktokSession_.state == TikTokSessionState::CreatingEndpoint ||
-                tiktokSession_.state == TikTokSessionState::Authenticating)
+            if (platformSession_->IsStarting())
                 resetStarting.Dismiss();
             else
                 startRestreamWhenReady_ = false;
@@ -1822,20 +1559,29 @@ public:
             return false;
 
         if (restreamState_ != RestreamState::Stopped) return false;
-        if (config_->tiktok.enabled && (!tiktokSession_.HasEndpoint() ||
-            tiktokSession_.state != TikTokSessionState::EndpointReady)) return false;
+        EnsurePlatformSession();
+        const bool platformEnabled = PlatformIntegrationEnabled();
+        if (platformEnabled && (!platformSession_ || !platformSession_->IsEndpointReady()))
+            return false;
+        const auto endpoint = platformSession_ ? platformSession_->Endpoint() : std::nullopt;
+        if (platformEnabled && !endpoint)
+            return false;
+
         ReleaseObsOutput();
         restreamState_ = RestreamState::Preparing;
-        if (config_->tiktok.enabled) SetMsg(obs_module_text("TikTok.StartingRestream"));
-        if (config_->tiktok.enabled)
-            blog(LOG_INFO, TAG "[TikTokStream] OBS output preparation started");
+        if (platformEnabled)
+            SetMsg(platformProvider_->Message(PlatformMessage::StartingRestream));
+        if (platformEnabled)
+            blog(LOG_INFO, TAG "[%s] OBS output preparation started",
+                 platformProvider_->Id().c_str());
 
         if (!CreateObsOutput()) {
             RestreamFailed("Error.StartOutput");
             return false;
         }
 
-        if (!PrepareOutputService(tiktokSession_.server, tiktokSession_.streamKey))
+        if (!PrepareOutputService(endpoint ? endpoint->server : std::string(),
+                                  endpoint ? endpoint->streamKey : std::string()))
         {
             RestreamFailed("Error.CreateRtmpService");
             return false;
@@ -1928,13 +1674,14 @@ public:
         ReleaseObsOutput();
         blog(LOG_WARNING, TAG "Local output failed for '%s' (%s)%s%s", config_->name.c_str(), message,
              detail.empty() ? "" : ": ", detail.empty() ? "" : detail.c_str());
-        if (tiktokSession_.HasEndpoint())
-            blog(LOG_WARNING, TAG "[TikTokStream] Local failure (%s); endpoint preserved", message);
+        if (PlatformHasEndpoint())
+            blog(LOG_WARNING, TAG "[%s] Local failure (%s); endpoint preserved",
+                 platformProvider_ ? platformProvider_->Id().c_str() : "platform", message);
         QString msg = QString::fromUtf8(obs_module_text(message));
         if (!detail.empty())
             msg += "\n" + QString::fromUtf8(detail.c_str());
-        if (tiktokSession_.HasEndpoint())
-            msg += "\n" + QString::fromUtf8(obs_module_text("TikTok.EndpointReady"));
+        if (PlatformHasEndpoint())
+            msg += "\n" + platformProvider_->Message(PlatformMessage::EndpointReady);
         SetMsg(msg);
     }
 
@@ -1945,15 +1692,17 @@ public:
         startRestreamWhenReady_ = false;
         // A deferred start (endpoint creation/login in flight) is cancelled
         // here; release the starting guard so a later Start can proceed.
-        // An already-created endpoint is preserved (see OnTikTokPrepared).
+        // An already-created endpoint is preserved for retry.
         isStarting_ = false;
         if (!IsBusy() || !IsRunning()) {
             ReleaseObsOutput();
             isBusy_ = false;
-            if (tiktokSession_.HasEndpoint())
-                SetMsg(obs_module_text(tiktokSession_.state == TikTokSessionState::Error ?
-                    "TikTok.SessionExpired" : "TikTok.RestreamStopped"));
-            if (endAfterStop_) { endAfterStop_ = false; EndTikTokEndpoint(); }
+            if (PlatformHasEndpoint()) {
+                SetMsg(platformSession_->HasError()
+                    ? platformProvider_->Message(PlatformMessage::SessionExpired)
+                    : platformProvider_->Message(PlatformMessage::RestreamStopped));
+            }
+            if (endAfterStop_) { endAfterStop_ = false; EndPlatformEndpoint(); }
             return;
         }
         if (restreamState_ == RestreamState::Stopping) return;
@@ -2034,9 +1783,7 @@ public:
     void LoadConfig()
     {
         name_->setText(QString::fromUtf8(config_->name));
-        create_live_btn_->setVisible(config_->tiktok.enabled);
-        end_live_btn_->setVisible(config_->tiktok.enabled);
-        UpdateTikTokActions();
+        UpdatePlatformActions();
         if (enabled_cb_)
             enabled_cb_->setChecked(config_->enabled);
     }
@@ -2110,8 +1857,13 @@ public:
         }
 
         config_ = std::move(newTarget);
-        if (!config_->tiktok.enabled && tiktokSession_.HasEndpoint())
-            EndTikTokEndpoint();
+        EnsurePlatformSession();
+        if (!PlatformIntegrationEnabled() && platformSession_ &&
+            (platformSession_->HasEndpoint() || platformSession_->IsBusy() ||
+             platformSession_->IsCreationUncertain()))
+            EndPlatformEndpoint();
+        else if (platformSession_)
+            platformSession_->UpdateConfig(config_);
         LoadConfig();
         UpdateStatusDot();
         // A running output keeps its old encoder when the config id changed;
@@ -2182,25 +1934,35 @@ public:
 
     void Stop()
     {
-        ShutdownTikTokIntegration();
+        ShutdownPlatformIntegration();
     }
 
     void SetMsg(QString msg)
     {
-        UpdateTikTokActions();
+        UpdatePlatformActions();
         msg_->setText(msg);
         msg_->setToolTip(msg);
     }
 
-    void UpdateTikTokActions()
+    void UpdatePlatformActions()
     {
-        if (!create_live_btn_ || !config_->tiktok.enabled) return;
-        const auto state = tiktokSession_.state;
-        const bool busy = state == TikTokSessionState::Authenticating ||
-            state == TikTokSessionState::CreatingEndpoint || state == TikTokSessionState::EndingEndpoint;
-        create_live_btn_->setEnabled(!busy && !tiktokSession_.HasEndpoint() && !endpointCreationUncertain_);
-        end_live_btn_->setEnabled(state != TikTokSessionState::EndingEndpoint &&
-            (tiktokSession_.HasEndpoint() || state == TikTokSessionState::CreatingEndpoint || endpointCreationUncertain_));
+        if (!create_live_btn_ || !end_live_btn_)
+            return;
+        const bool enabled = PlatformIntegrationEnabled();
+        create_live_btn_->setVisible(enabled);
+        end_live_btn_->setVisible(enabled);
+        if (!enabled) {
+            btn_->setEnabled(true);
+            return;
+        }
+
+        const bool busy = platformSession_ && platformSession_->IsBusy();
+        const bool hasEndpoint = platformSession_ && platformSession_->HasEndpoint();
+        const bool creating = platformSession_ && platformSession_->IsCreating();
+        const bool uncertain = platformSession_ && platformSession_->IsCreationUncertain();
+        create_live_btn_->setEnabled(!busy && !hasEndpoint && !uncertain);
+        end_live_btn_->setEnabled(platformSession_ && !platformSession_->IsEnding() &&
+            (hasEndpoint || creating || uncertain));
         btn_->setEnabled(!busy);
     }
 
@@ -2243,7 +2005,9 @@ public:
             SetMsg(obs_module_text("Status.Streaming"));
 
             restreamState_ = RestreamState::Streaming;
-            if (config_->tiktok.enabled) blog(LOG_INFO, TAG "[TikTokStream] OBS output started");
+            if (PlatformIntegrationEnabled())
+                blog(LOG_INFO, TAG "[%s] OBS output started",
+                     platformProvider_->Id().c_str());
             ResetInfo();
             timer_->start();
             UpdateStatusDot();
@@ -2272,7 +2036,9 @@ public:
             SetMsg(obs_module_text("Status.Streaming"));
 
             restreamState_ = RestreamState::Streaming;
-            if (config_->tiktok.enabled) blog(LOG_INFO, TAG "[TikTokStream] OBS output started");
+            if (PlatformIntegrationEnabled())
+                blog(LOG_INFO, TAG "[%s] OBS output started",
+                     platformProvider_->Id().c_str());
             ResetInfo();
             timer_->start();
             UpdateStatusDot();
@@ -2301,8 +2067,9 @@ public:
             // Capture before ReleaseObsOutput() destroys the output.
             const std::string detail = TakeOutputLastError();
             ReleaseObsOutput();
-            if (tiktokSession_.HasEndpoint())
-                blog(LOG_INFO, TAG "[TikTokStream] OBS output stopped; endpoint preserved");
+            if (PlatformHasEndpoint())
+                blog(LOG_INFO, TAG "[%s] OBS output stopped; endpoint preserved",
+                     platformProvider_ ? platformProvider_->Id().c_str() : "platform");
             if (code != 0 && !detail.empty())
                 blog(LOG_WARNING, TAG "Output '%s' stopped with code %d: %s",
                      config_->name.c_str(), code, detail.c_str());
@@ -2316,8 +2083,8 @@ public:
             switch(code)
             {
                 case 0:
-                    if (tiktokSession_.HasEndpoint())
-                        SetMsg(obs_module_text("TikTok.RestreamStopped"));
+                    if (PlatformHasEndpoint())
+                        SetMsg(platformProvider_->Message(PlatformMessage::RestreamStopped));
                     break;
                 case -1:
                     SetMsg(obs_module_text("Error.WrongRTMPUrl"));
@@ -2339,11 +2106,11 @@ public:
             // recorded; the message above stays as the category.
             if (code != 0 && !detail.empty())
                 SetMsg(msg_->text() + "\n" + QString::fromUtf8(detail.c_str()));
-            if (code != 0 && tiktokSession_.state == TikTokSessionState::EndpointReady)
-                SetMsg(msg_->text() + "\n" + QString::fromUtf8(obs_module_text("TikTok.EndpointReady")));
-            if (tiktokSession_.state == TikTokSessionState::Error)
-                SetMsg(obs_module_text("TikTok.SessionExpired"));
-            if (endAfterStop_) { endAfterStop_ = false; EndTikTokEndpoint(); }
+            if (code != 0 && platformSession_ && platformSession_->IsEndpointReady())
+                SetMsg(msg_->text() + "\n" + platformProvider_->Message(PlatformMessage::EndpointReady));
+            if (platformSession_ && platformSession_->HasError())
+                SetMsg(platformProvider_->Message(PlatformMessage::SessionExpired));
+            if (endAfterStop_) { endAfterStop_ = false; EndPlatformEndpoint(); }
 
             UpdateStatusDot();
         });

@@ -185,6 +185,13 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   ./src/helpers.cpp
   ./src/encoder-source.h
   ./src/encoder-source.cpp
+  ./src/platform/platform-provider.h
+  ./src/platform/platform-provider.cpp
+  ./src/platform/tiktok-provider.cpp
+  ./src/platform/tiktok-session.h
+  ./src/platform/tiktok-session.cpp
+  ./src/platform/tiktok-target-editor.h
+  ./src/platform/tiktok-target-editor.cpp
   ./src/streamlabs-tiktok.h
   ./src/streamlabs-tiktok.cpp
   ./src/tiktok/constants.h

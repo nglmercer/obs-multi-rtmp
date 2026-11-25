@@ -10,7 +10,7 @@
 #include "plugin-support.h"
 
 #include "output-config.h"
-#include "tiktok/auth-manager.h"
+#include "platform/platform-provider.h"
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -650,11 +650,15 @@ bool obs_module_load()
     blog(LOG_INFO, TAG "version: %s by SoraYuki https://github.com/sorayuki/obs-multi-rtmp/", PLUGIN_VERSION);
 
     // The dock constructor already loaded the profile config (and diverted
-    // any legacy plaintext TikTok token to the migration sink). Restore the
-    // secure session first; migration runs only when no session exists.
+    // any legacy plaintext platform tokens to each migration sink). Restore
+    // secure sessions first; migration runs only when no session exists.
     QMetaObject::invokeMethod(mainwin, []() {
-        TikTokAuthManager::instance().restoreSession();
-        TikTokAuthManager::instance().migrateLegacyTokens(ConsumeLegacyTikTokTokens());
+        for (auto *provider : PlatformProviders()) {
+            if (!provider)
+                continue;
+            provider->RestoreSession();
+            provider->MigrateLegacyConfiguration();
+        }
     });
 
     obs_frontend_add_event_callback(
@@ -671,11 +675,13 @@ bool obs_module_load()
             else if (event == obs_frontend_event::OBS_FRONTEND_EVENT_PROFILE_CHANGED)
             {
                 dock->LoadConfig();
-                // The TikTok session is global, not per-profile, so no
+                // Platform sessions are global, not per-profile, so no
                 // re-restore is needed; only migrate this profile's legacy
-                // token when logged out (otherwise it is discarded with a
-                // config sanitize).
-                TikTokAuthManager::instance().migrateLegacyTokens(ConsumeLegacyTikTokTokens());
+                // tokens when logged out (otherwise they are discarded with
+                // a config sanitize).
+                for (auto *provider : PlatformProviders())
+                    if (provider)
+                        provider->MigrateLegacyConfiguration();
             }
         }, dock
     );
@@ -685,8 +691,10 @@ bool obs_module_load()
 
 void obs_module_unload()
 {
-    // Join every TikTok worker thread before the module unmaps.
-    TikTokAuthManager::instance().shutdown();
+    // Join every provider worker thread before the module unmaps.
+    for (auto *provider : PlatformProviders())
+        if (provider)
+            provider->Shutdown();
 }
 
 const char *obs_module_description(void)

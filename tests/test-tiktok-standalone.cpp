@@ -38,6 +38,11 @@ static obs_output_t *InterceptCreateOutput(const char *id, const char *name,
 #define obs_output_create InterceptCreateOutput
 #include "../src/push-widget.cpp"
 #undef obs_output_create
+#include "../src/platform/tiktok-session.h"
+#include "../src/tiktok/streamlabs-client.h"
+#include "../src/tiktok/auth-manager.h"
+#include "../src/tiktok/cleanup.h"
+#include "../src/tiktok/worker.h"
 
 namespace {
 std::atomic<int> starts{0}, ends{0};
@@ -70,7 +75,13 @@ bool StreamlabsTikTokClient::EndStream(const std::string &, std::string *, TikTo
     std::cerr << "FAIL line " << __LINE__ << ": " #condition "\n"; return false; } } while (0)
 
 struct StandaloneTest {
-    using Remote = PushWidgetImpl::TikTokSessionState;
+    using Remote = TikTokPlatformSession::State;
+    static TikTokPlatformSession *Session(PushWidgetImpl *widget) {
+        return dynamic_cast<TikTokPlatformSession *>(widget->platformSession_.get());
+    }
+    static TikTokPlatformSession *Session(const std::unique_ptr<PushWidgetImpl> &widget) {
+        return Session(widget.get());
+    }
     using Local = PushWidgetImpl::RestreamState;
     template<class Predicate> static bool wait(Predicate predicate, int ms = 15000) {
         QElapsedTimer elapsed; elapsed.start();
@@ -99,12 +110,12 @@ struct StandaloneTest {
 
     static void presetEndpoint(PushWidgetImpl *widget, const std::string &id,
                                const std::string &server) {
-        widget->tiktokSession_.streamId = id;
-        widget->tiktokSession_.server = server;
-        widget->tiktokSession_.streamKey = "FIXTURE-KEY";
-        widget->tiktokSession_.client =
+        Session(widget)->tiktokSession_.streamId = id;
+        Session(widget)->tiktokSession_.server = server;
+        Session(widget)->tiktokSession_.streamKey = "FIXTURE-KEY";
+        Session(widget)->tiktokSession_.client =
             std::make_shared<StreamlabsTikTokClient>("FIXTURE");
-        widget->tiktokSession_.state = Remote::EndpointReady;
+        Session(widget)->tiktokSession_.state = Remote::EndpointReady;
         // Mirror OnTikTokPrepared()'s adoption accounting so owner teardown
         // balances the registry exactly.
         TikTokLiveRegistry::addLive();
@@ -221,14 +232,14 @@ struct StandaloneTest {
             return !widget->IsRunning() &&
                    widget->restreamState_ == Local::Stopped;
         }));
-        CHECK(widget->tiktokSession_.HasEndpoint());
-        CHECK(widget->tiktokSession_.streamId == "standalone-fixture-a");
+        CHECK(Session(widget)->tiktokSession_.HasEndpoint());
+        CHECK(Session(widget)->tiktokSession_.streamId == "standalone-fixture-a");
         CHECK(ends.load() == 0);
 
         // Second start reuses the same endpoint and encoder names.
         widget->StartStreaming();
         CHECK(wait([&] { return widget->IsRunning(); }));
-        CHECK(widget->tiktokSession_.streamId == "standalone-fixture-a");
+        CHECK(Session(widget)->tiktokSession_.streamId == "standalone-fixture-a");
         CHECK(starts.load() == 0);
         CHECK(wait([&] {
             return widget->output_ &&
@@ -236,12 +247,12 @@ struct StandaloneTest {
         }));
         widget->StopStreaming();
         CHECK(wait([&] { return !widget->IsRunning(); }));
-        CHECK(widget->tiktokSession_.HasEndpoint() && ends.load() == 0);
+        CHECK(Session(widget)->tiktokSession_.HasEndpoint() && ends.load() == 0);
 
         // Explicit End closes the first session before the second preset
         // adopts another one, keeping registry accounting exact.
-        widget->EndTikTokEndpoint();
-        CHECK(wait([&] { return widget->tiktokSession_.state == Remote::Idle; }));
+        widget->EndPlatformEndpoint();
+        CHECK(wait([&] { return Session(widget)->tiktokSession_.state == Remote::Idle; }));
         CHECK(ends.load() == 1);
 
         // Real rtmp_output against a closed localhost port: encoders
@@ -249,14 +260,14 @@ struct StandaloneTest {
         // endpoint is preserved for retry (no /stream/end).
         redirectRtmpToNull = false;
         presetEndpoint(widget.get(), "standalone-fixture-b", "rtmp://127.0.0.1:9/live");
-        widget->tiktokSession_.streamKey = "FIXTURE-KEY";
+        Session(widget)->tiktokSession_.streamKey = "FIXTURE-KEY";
         widget->StartStreaming();
         CHECK(wait([&] {
             return widget->restreamState_ == Local::Stopped;
         }, 30000));
         std::cout << "refused stop code=" << widget->lastErrorCode_
                   << " msg=" << widget->msg_->text().toStdString() << "\n";
-        CHECK(widget->tiktokSession_.HasEndpoint());
+        CHECK(Session(widget)->tiktokSession_.HasEndpoint());
         CHECK(ends.load() == 1);
         CHECK(!widget->msg_->text().isEmpty());
         widget.reset();
