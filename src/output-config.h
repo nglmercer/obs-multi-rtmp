@@ -4,6 +4,7 @@
 #include <optional>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <list>
 
@@ -77,8 +78,24 @@ public:
     std::list<OutputTargetConfigPtr> targets;
     std::list<VideoEncoderConfigPtr> videoConfig;
     std::list<AudioEncoderConfigPtr> audioConfig;
+
+    OutputTargetConfigPtr FindTarget(const std::string& id) const;
+    VideoEncoderConfigPtr FindVideoConfig(const std::string& id) const;
+    AudioEncoderConfigPtr FindAudioConfig(const std::string& id) const;
+    std::string GenerateId() const;
 };
 
+struct GlobalEditSnapshot {
+    std::unordered_set<std::string> activeTargetIds;
+    std::unordered_set<std::string> activeVideoConfigIds;
+    std::unordered_set<std::string> activeAudioConfigIds;
+};
+
+struct GlobalConfigUpdateContext {
+    std::unordered_set<std::string> updatedVideoConfigIds;
+    std::unordered_set<std::string> updatedAudioEncoderNames;
+    std::vector<std::string> notices;
+};
 template<class T, class S>
 inline T FindById(std::list<T>& list, const S& id) {
     for(auto& x: list) {
@@ -94,8 +111,6 @@ MultiOutputConfig& GlobalMultiOutputConfig();
 void SaveMultiOutputConfig();
 
 bool LoadMultiOutputConfig();
-
-std::string GenerateId(MultiOutputConfig& config);
 
 // One-time migration sink for legacy plaintext tokens found in
 // obs-multi-rtmp.json. LoadTargetConfig collects them here instead of

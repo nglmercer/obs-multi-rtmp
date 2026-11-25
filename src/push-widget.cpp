@@ -2,15 +2,16 @@
 #include "helpers.h"
 #include <regex>
 #include <atomic>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <tuple>
-#include <mutex>
+#include <unordered_map>
 #include <QCoreApplication>
 #include <QThread>
 #include <QPointer>
 #include <QMetaObject>
 #include "push-widget.h"
-#include "edit-widget.h"
 #include "encoder-source.h"
 #include "output-config.h"
 #include "protocols.h"
@@ -21,6 +22,189 @@
 #include "tiktok/worker.h"
 
 #include "obs.hpp"
+
+static nlohmann::json OBSDataToJson(obs_data_t* data)
+{
+    if (!data)
+        return nlohmann::json::object();
+
+    auto serialized = obs_data_get_json(data);
+    if (!serialized)
+        return nlohmann::json::object();
+
+    try {
+        return nlohmann::json::parse(serialized);
+    } catch (...) {
+        return nlohmann::json::object();
+    }
+}
+
+static void UpdateEncoderSettings(
+    obs_encoder_t* encoder,
+    const nlohmann::json& oldParams,
+    const nlohmann::json& newParams,
+    const char* encoderType)
+{
+    if (!encoder)
+        return;
+
+    OBSDataAutoRelease settings = obs_encoder_get_settings(encoder);
+    OBSDataAutoRelease defaults = obs_encoder_get_defaults(encoder);
+    auto currentJson = OBSDataToJson(settings);
+    auto defaultsJson = OBSDataToJson(defaults);
+    auto merged = newParams.is_object() ? newParams : nlohmann::json::object();
+
+    if (oldParams.is_object()) {
+        for (const auto& [key, oldValue] : oldParams.items()) {
+            if (merged.contains(key))
+                continue;
+            if (defaultsJson.contains(key)) {
+                merged[key] = defaultsJson[key];
+            } else {
+                blog(LOG_WARNING, TAG "%s parameter '%s' has no default; keeping its current value", encoderType, key.c_str());
+                merged[key] = currentJson.value(key, oldValue);
+            }
+        }
+    }
+
+    OBSDataAutoRelease updatedSettings = obs_data_create_from_json(merged.dump().c_str());
+    if (!updatedSettings)
+        return;
+
+    // obs_encoder_update() applies on top of the live settings; the merged
+    // json already carries defaults for removed keys, so there is no need to
+    // clear the live object (an encoder thread could read it half-empty).
+    obs_encoder_update(encoder, updatedSettings);
+}
+
+class SharedSceneView final
+{
+    OBSEncoder encoder_;
+    obs_view_t* view_ = nullptr;
+    video_t* video_ = nullptr;
+    std::mutex source_mutex_;
+
+public:
+    explicit SharedSceneView(obs_encoder_t* encoder)
+        : encoder_(encoder)
+    {
+    }
+
+    ~SharedSceneView()
+    {
+        if (!view_)
+            return;
+
+        obs_view_remove(view_);
+        OBSSourceAutoRelease source = obs_view_get_source(view_, 0);
+        if (source)
+            obs_source_dec_active(source);
+        obs_view_set_source(view_, 0, nullptr);
+        obs_view_destroy(view_);
+    }
+
+    bool Initialize(obs_source_t* source)
+    {
+        if (!source)
+            return false;
+
+        view_ = obs_view_create();
+        if (!view_)
+            return false;
+
+        obs_view_set_source(view_, 0, source);
+        obs_source_inc_active(source);
+        video_ = obs_view_add(view_);
+        return video_ != nullptr;
+    }
+
+    bool SetSource(obs_source_t* source)
+    {
+        if (!view_ || !source)
+            return false;
+
+        std::lock_guard<std::mutex> lock(source_mutex_);
+        OBSSourceAutoRelease current = obs_view_get_source(view_, 0);
+        if (current == source)
+            return true;
+
+        obs_view_set_source(view_, 0, source);
+        if (current)
+            obs_source_dec_active(current);
+        obs_source_inc_active(source);
+        return true;
+    }
+
+    video_t* Video() const
+    {
+        return video_;
+    }
+};
+
+class SharedSceneViewManager final
+{
+    std::mutex mutex_;
+    std::unordered_map<obs_encoder_t*, std::weak_ptr<SharedSceneView>> entries_;
+
+public:
+    std::shared_ptr<SharedSceneView> Acquire(obs_encoder_t* encoder, obs_source_t* source)
+    {
+        if (!encoder || !source)
+            return {};
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            if (it->second.expired())
+                it = entries_.erase(it);
+            else
+                ++it;
+        }
+
+        auto it = entries_.find(encoder);
+        if (it != entries_.end()) {
+            auto entry = it->second.lock();
+            if (entry) {
+                lock.unlock();
+                if (!entry->SetSource(source)) {
+                    blog(LOG_ERROR, TAG "Could not update the shared output scene.");
+                    return {};
+                }
+                return entry;
+            }
+            entries_.erase(it);
+        }
+
+        if (obs_encoder_active(encoder)) {
+            blog(LOG_ERROR, TAG "Shared video encoder is active without a registered scene view.");
+            return {};
+        }
+
+        auto entry = std::make_shared<SharedSceneView>(encoder);
+        if (!entry->Initialize(source)) {
+            lock.unlock();
+            entry.reset();
+            blog(LOG_ERROR, TAG "Could not create the shared output scene view.");
+            return {};
+        }
+
+        obs_encoder_set_video(encoder, entry->Video());
+        if (obs_encoder_parent_video(encoder) != entry->Video()) {
+            lock.unlock();
+            entry.reset();
+            blog(LOG_ERROR, TAG "Could not bind the shared scene view to the video encoder.");
+            return {};
+        }
+
+        entries_[encoder] = entry;
+        return entry;
+    }
+};
+
+static SharedSceneViewManager& GetSharedSceneViewManager()
+{
+    static SharedSceneViewManager manager;
+    return manager;
+}
 
 class IOBSOutputEventHanlder
 {
@@ -124,13 +308,12 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     uint64_t total_bytes_ = 0;
     QTimer* timer_ = 0;
 
-    QPushButton* edit_btn_ = 0;
-    QPushButton* remove_btn_ = 0;
-
     obs_output_t* output_ = 0;
+    // Owned reference to the service handed to output_ (the output itself only keeps a weak back-pointer).
+    obs_service_t* service_ = 0;
     bool using_main_video_encoder_ = false;
     bool using_main_audio_encoder_ = false;
-    obs_view_t* scene_view_ = 0;
+    std::shared_ptr<SharedSceneView> scene_view_;
     bool isUseDelay_ = false;
     std::atomic_bool isStarting_ = false;
 
@@ -141,6 +324,7 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     // Set by GetVideoEncoder()/GetAudioEncoder(), consumed by
     // PrepareOutputEncoders() for an actionable message.
     const char* lastEncoderError_ = nullptr;
+    std::atomic_bool isBusy_ = false;
 
     // Registered under the stable target id (not the display name) so key
     // bindings survive renames. Their description label is set once at
@@ -171,10 +355,6 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     QPushButton *create_live_btn_ = nullptr;
     QPushButton *end_live_btn_ = nullptr;
 
-    QPushButton* GetDeleteButton() {
-        return remove_btn_;
-    }
-
     bool PrepareOutputService(const std::string &server = {}, const std::string &streamKey = {})
     {
         if (!output_) {
@@ -182,10 +362,12 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             return false;
         }
 
-        // Never replace the service of a live output: the setter would
-        // silently ignore the new service.
-        if (obs_output_active(output_)) {
-            blog(LOG_ERROR, TAG "Prepare output service while output is active.");
+        // The output is rebuilt per start, so no service should be left over.
+        // Freeing one here would be unsafe: libobs ignores
+        // obs_output_set_service(output, nullptr), so the output would keep a
+        // dangling pointer into the freed service.
+        if (service_) {
+            blog(LOG_ERROR, TAG "Stale service object before creating a new one.");
             return false;
         }
 
@@ -206,26 +388,27 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         if (!conf)
             return false;
 
-        // Build the replacement BEFORE touching the previous service: if
-        // creation fails, the old service stays owned and valid instead of
-        // leaving the output pointed at freed memory. The setter takes no
-        // reference and merely borrows, so the old creation reference is
-        // dropped only after the replacement is installed.
-        auto service = obs_service_create(service_id, "multi-output-service", conf, nullptr);
+        // We own this reference. The output only keeps a weak back-pointer,
+        // which obs_output_destroy() clears again.
+        obs_service_t* service = obs_service_create(service_id, "multi-output-service", conf, nullptr);
         if (!service)
             return false;
-        auto previous = obs_output_get_service(output_); // borrowed
         obs_output_set_service(output_, service);
-        if (previous && previous != service)
-            obs_service_release(previous);
-        if (obs_output_get_service(output_) != service) {
-            // The output did not take ownership (it does not use
-            // services, e.g. file/muxer outputs): drop our creation
-            // reference instead of leaking it. Streaming continues with
-            // the output's own settings.
-            obs_service_release(service);
-        }
+        service_ = service;
 
+        return true;
+    }
+
+
+    // Only valid once output_ is gone: destroying the output is what clears the
+    // service's back-pointer, so freeing it earlier leaves a dangling pointer.
+    bool ReleaseOutputService()
+    {
+        if (!service_)
+            return true;
+
+        obs_service_release(service_);
+        service_ = nullptr;
         return true;
     }
 
@@ -253,13 +436,9 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
                     blog(LOG_ERROR, TAG "Output scene is not found.");
                     return false;
                 }
-                ReleaseOutputSceneView();
-
-                scene_view_ = obs_view_create();
-                obs_view_set_source(scene_view_, 0, scene);
-                obs_source_inc_active(scene);
-                auto scene_video = obs_view_add(scene_view_);
-                obs_encoder_set_video(venc, scene_video);
+                scene_view_ = GetSharedSceneViewManager().Acquire(venc, scene);
+                if (!scene_view_)
+                    return false;
             }
         }
 
@@ -288,18 +467,7 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
 
 
     bool ReleaseOutputSceneView() {
-        if (!scene_view_)
-            return true;
-
-        obs_view_remove(scene_view_);
-        OBSSourceAutoRelease source = obs_view_get_source(scene_view_, 0);
-        if (source) {
-            obs_source_dec_active(source);
-        }
-        obs_view_set_source(scene_view_, 0, nullptr);
-        obs_view_destroy(scene_view_);
-        scene_view_ = nullptr;
-
+        scene_view_.reset();
         return true;
     }
 
@@ -628,11 +796,59 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         endpointCreationUncertain_ = false;
         TikTokWorkerService::instance().cancelReceiver(this);
         ForceReleaseObsOutput();
+        isBusy_ = false;
         if (tiktokSession_.HasEndpoint() &&
             tiktokSession_.state != TikTokSessionState::EndingEndpoint)
             SubmitTikTokCleanup(tiktokSession_.client, tiktokSession_.streamId, true);
         tiktokSession_.Reset();
         QCoreApplication::removePostedEvents(this, QEvent::MetaCall);
+    }
+
+    static bool VideoConfigEqual(const VideoEncoderConfig& left, const VideoEncoderConfig& right)
+    {
+        return left.encoderId == right.encoderId
+            && left.fpsDenumerator == right.fpsDenumerator
+            && left.encoderParams == right.encoderParams
+            && left.outputScene == right.outputScene
+            && left.resolution == right.resolution;
+    }
+
+    static bool AudioConfigEqual(const AudioEncoderConfig& left, const AudioEncoderConfig& right)
+    {
+        if (left.encoderId != right.encoderId
+            || left.encoderParams != right.encoderParams
+            || left.mixerId != right.mixerId
+            || left.audioTracks.size() != right.audioTracks.size())
+            return false;
+
+        auto leftTrack = left.audioTracks.begin();
+        auto rightTrack = right.audioTracks.begin();
+        for (; leftTrack != left.audioTracks.end(); ++leftTrack, ++rightTrack) {
+            if ((*leftTrack)->mixer_track != (*rightTrack)->mixer_track
+                || (*leftTrack)->output_track != (*rightTrack)->output_track)
+                return false;
+        }
+        return true;
+    }
+
+    void UpdateSceneView(const MultiOutputConfig& newConfig)
+    {
+        if (!scene_view_ || !config_->videoConfig)
+            return;
+
+        auto videoConfig = newConfig.FindVideoConfig(*config_->videoConfig);
+        if (!videoConfig || !videoConfig->outputScene)
+            return;
+
+        const auto& sceneName = *videoConfig->outputScene;
+        OBSSourceAutoRelease next = obs_get_source_by_name(sceneName.c_str());
+        if (!next) {
+            blog(LOG_WARNING, TAG "Output scene '%s' is not found; keeping the current scene", sceneName.c_str());
+            return;
+        }
+
+        if (!scene_view_->SetSource(next))
+            blog(LOG_WARNING, TAG "Could not update output scene '%s'", sceneName.c_str());
     }
 
     std::string VideoEncoderName() {
@@ -1100,7 +1316,6 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             btn_->setText(obs_module_text("Btn.Start"));
             btn_->setEnabled(true);
         }
-        if (remove_btn_) remove_btn_->setEnabled(true);
         if (!output_)
             return true;
 
@@ -1120,15 +1335,10 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         DisconnectSignals(output_);
         bool ret = ReleaseOutputEncoder();
 
-        // Destroy the output while our service reference is still alive:
-        // obs_output_destroy() only clears the service back-pointer and
-        // never releases the service itself, so releasing the service
-        // first would leave destroy writing to freed memory.
-        auto service = obs_output_get_service(output_);
+        // obs_output_destroy() clears the service's weak back-pointer.
         obs_output_release(output_);
         output_ = nullptr;
-        if (service)
-            obs_service_release(service);
+        ReleaseOutputService();
 
         ret = ReleaseOutputSceneView() && ret;
 
@@ -1148,11 +1358,9 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         if (!output_)
             return;
         DisconnectSignals(output_);
-        auto service = obs_output_get_service(output_);
         obs_output_release(output_);
         output_ = nullptr;
-        if (service)
-            obs_service_release(service);
+        ReleaseOutputService();
         ReleaseOutputSceneView();
     }
 
@@ -1249,43 +1457,51 @@ public:
         });
 
         auto layout = new QGridLayout(this);
-        layout->addWidget(status_dot_ = new QLabel(u8"●", this), 0, 0);
-        layout->addWidget(name_ = new QLabel(obs_module_text("NewStreaming"), this), 0, 1, 1, 3);
 
-        layout->addWidget(enabled_cb_ = new QCheckBox(this), 1, 0);
+        layout->addWidget(enabled_cb_ = new QCheckBox(this), 0, 0);
         enabled_cb_->setToolTip(obs_module_text("Target.Enabled"));
         QObject::connect(enabled_cb_, &QCheckBox::clicked, [this](bool checked) {
             SetEnabled(checked);
         });
 
-        layout->addWidget(btn_ = new QPushButton(obs_module_text("Btn.Start"), this), 1, 1);
+        // Status dot hugs the title: both live in a zero-spacing row layout.
+        auto titleWidget = new QWidget(this);
+        auto titleLayout = new QHBoxLayout(titleWidget);
+        titleLayout->setContentsMargins(0, 0, 0, 0);
+        titleLayout->setSpacing(0);
+        titleLayout->addWidget(status_dot_ = new QLabel(u8"●", this));
+        titleLayout->addWidget(name_ = new QLabel(obs_module_text("NewStreaming"), this));
+        titleLayout->addStretch(1);
+        layout->addWidget(titleWidget, 0, 1);
+
+        // Start/Stop shares the title row, pushed to the right edge.
+        layout->addWidget(btn_ = new QPushButton(obs_module_text("Btn.Start"), this), 0, 2);
         QObject::connect(btn_, &QPushButton::clicked, [this]() {
             StartStop();
         });
 
-        layout->addWidget(edit_btn_ = new QPushButton(obs_module_text("Btn.Edit"), this), 1, 2);
-        QObject::connect(edit_btn_, &QPushButton::clicked, [this]() {
-            ShowEditDlg();
-        });
-
-        layout->addWidget(remove_btn_ = new QPushButton(obs_module_text("Btn.Delete"), this), 1, 3);
-
-        // Keep action buttons usable in narrow docks across OBS themes.
-        for (auto button : { btn_, edit_btn_, remove_btn_ }) {
-            button->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-            button->setMinimumWidth(0);
-            button->setMinimumHeight(button->fontMetrics().height() + 8);
+        // Keep the button usable in narrow docks across OBS themes.
+        btn_->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
+        btn_->setMinimumHeight(btn_->fontMetrics().height() + 8);
+        {
+            auto fm = btn_->fontMetrics();
+            auto startW = fm.horizontalAdvance(QString::fromUtf8(obs_module_text("Btn.Start")));
+            auto stopW = fm.horizontalAdvance(QString::fromUtf8(obs_module_text("Status.Stop")));
+            btn_->setMinimumWidth((startW > stopW ? startW : stopW) + 24);
         }
+        // Title takes the remaining space so the button stays compact.
         layout->setColumnStretch(1, 1);
-        layout->setColumnStretch(2, 1);
-        layout->setColumnStretch(3, 1);
 
-        layout->addWidget(msg_ = new QLabel(u8"", this), 2, 0, 1, 4);
+        // Message text: keep it from soaking up spare height, otherwise the
+        // item grows taller than its content.
+        layout->addWidget(msg_ = new QLabel(u8"", this), 1, 0, 1, 3);
         msg_->setWordWrap(true);
+        msg_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
+
         create_live_btn_ = new QPushButton(obs_module_text("TikTok.CreateEndpoint"), this);
         end_live_btn_ = new QPushButton(obs_module_text("TikTok.EndLive"), this);
-        layout->addWidget(create_live_btn_, 3, 0, 1, 2);
-        layout->addWidget(end_live_btn_, 3, 2);
+        layout->addWidget(create_live_btn_, 2, 0, 1, 2);
+        layout->addWidget(end_live_btn_, 2, 2);
         QObject::connect(create_live_btn_, &QPushButton::clicked, this, [this]() { CreateTikTokEndpoint(); });
         QObject::connect(end_live_btn_, &QPushButton::clicked, this, [this]() { EndTikTokEndpoint(); });
         auto &auth = TikTokAuthManager::instance();
@@ -1317,7 +1533,6 @@ public:
                 SetMsg(error);
             }
         });
-        layout->addItem(new QSpacerItem(0, 10), 4, 0);
         setLayout(layout);
 
         LoadConfig();
@@ -1358,6 +1573,28 @@ public:
             obs_hotkey_unregister(startHotkeyId_);
         if (stopHotkeyId_ != OBS_INVALID_HOTKEY_ID)
             obs_hotkey_unregister(stopHotkeyId_);
+    }
+
+    // QLabel with word wrap reports a far too tall sizeHint, which makes the
+    // list item reserve empty space below the message. Ask the layout for the
+    // height it actually needs at the current width instead.
+    int heightForWidth(int w) const override
+    {
+        auto lay = layout();
+        if (!lay)
+            return QWidget::heightForWidth(w);
+        return lay->hasHeightForWidth() ? lay->heightForWidth(w) : lay->sizeHint().height();
+    }
+
+    QSize sizeHint() const override
+    {
+        auto lay = layout();
+        if (!lay)
+            return QWidget::sizeHint();
+
+        auto hint = lay->sizeHint();
+        hint.setHeight(heightForWidth(width() > 0 ? width() : hint.width()));
+        return hint;
     }
 
     static bool CodecInList(const char* list, const char* codec)
@@ -1545,7 +1782,7 @@ public:
         // async TikTok endpoint creation below; terminal states (OnStarted,
         // OnStopped, endpoint/auth failure, RestreamFailed) clear it.
         bool expected = false;
-        if (IsRunning() || !isStarting_.compare_exchange_strong(expected, true))
+        if (IsBusy() || !isStarting_.compare_exchange_strong(expected, true))
             return;
         auto resetStarting = finally([this] { isStarting_ = false; });
 
@@ -1617,7 +1854,9 @@ public:
         }
 
         restreamState_ = RestreamState::Connecting;
+        isBusy_ = true;
         if (!obs_output_start(output_)) {
+            isBusy_ = false;
             RestreamFailed("Error.StartOutput");
             return false;
         }
@@ -1708,8 +1947,9 @@ public:
         // here; release the starting guard so a later Start can proceed.
         // An already-created endpoint is preserved (see OnTikTokPrepared).
         isStarting_ = false;
-        if (!IsRunning()) {
+        if (!IsBusy() || !IsRunning()) {
             ReleaseObsOutput();
+            isBusy_ = false;
             if (tiktokSession_.HasEndpoint())
                 SetMsg(obs_module_text(tiktokSession_.state == TikTokSessionState::Error ?
                     "TikTok.SessionExpired" : "TikTok.RestreamStopped"));
@@ -1758,16 +1998,16 @@ public:
             // ready); STARTING is kept as a fallback so sync-start stays
             // responsive. StartStop()/StartStreaming() are exactly-once via
             // IsRunning()/restreamState_/isStarting_ guards.
-            if (!IsRunning() && config_->syncStart) {
+            if (!IsBusy() && config_->syncStart) {
                 StartStop();
             }
         } else if (ev == ev_t::OBS_FRONTEND_EVENT_RECORDING_STARTED) {
-            if (!IsRunning() && config_->syncStart) {
+            if (!IsBusy() && config_->syncStart) {
                 StartStop();
             }
         } else if (ev == ev_t::OBS_FRONTEND_EVENT_STREAMING_STOPPING ||
                    ev == ev_t::OBS_FRONTEND_EVENT_STREAMING_STOPPED) {
-            if (config_->syncStop && (IsRunning() || restreamState_ != RestreamState::Stopped ||
+            if (config_->syncStop && (IsBusy() || restreamState_ != RestreamState::Stopped ||
                                       startRestreamWhenReady_)) {
                 StopStreaming();
             }
@@ -1801,6 +2041,85 @@ public:
             enabled_cb_->setChecked(config_->enabled);
     }
 
+    void UpdateConfig(const MultiOutputConfig& newConfig, GlobalConfigUpdateContext& context) override
+    {
+        auto newTarget = newConfig.FindTarget(targetid_);
+        if (!newTarget)
+            return;
+
+        auto oldTarget = config_;
+        auto& oldConfig = GlobalMultiOutputConfig();
+        const bool busy = IsBusy();
+        const auto targetName = QString::fromUtf8(newTarget->name.c_str());
+
+        if (oldTarget->protocol != newTarget->protocol || oldTarget->serviceParam != newTarget->serviceParam) {
+            context.notices.push_back(QString::fromUtf8(obs_module_text("Notice.ServiceChanged"))
+                .arg(targetName).toUtf8().toStdString());
+        }
+
+        const bool videoIdChanged = oldTarget->videoConfig != newTarget->videoConfig;
+        const bool audioIdChanged = oldTarget->audioConfig != newTarget->audioConfig;
+        if ((videoIdChanged || audioIdChanged) && busy) {
+            context.notices.push_back(QString::fromUtf8(obs_module_text("Notice.EncoderConfigChanged"))
+                .arg(targetName).toUtf8().toStdString());
+        }
+
+        if (!videoIdChanged && newTarget->videoConfig) {
+            const auto& configId = *newTarget->videoConfig;
+            auto oldVideo = oldConfig.FindVideoConfig(configId);
+            auto newVideo = newConfig.FindVideoConfig(configId);
+            if (oldVideo && newVideo && !VideoConfigEqual(*oldVideo, *newVideo)) {
+                OBSEncoderAutoRelease encoder = obs_get_encoder_by_name(("multi-rtmp-venc" + configId).c_str());
+                if (encoder) {
+                    if (context.updatedVideoConfigIds.insert(configId).second)
+                        UpdateEncoderSettings(encoder, oldVideo->encoderParams, newVideo->encoderParams, "video encoder");
+                    if (busy) {
+                        context.notices.push_back(QString::fromUtf8(obs_module_text("Notice.EncoderParamsChanged"))
+                            .arg(targetName).toUtf8().toStdString());
+                    }
+                }
+            }
+        }
+
+        if (!audioIdChanged && newTarget->audioConfig) {
+            const auto& configId = *newTarget->audioConfig;
+            auto oldAudio = oldConfig.FindAudioConfig(configId);
+            auto newAudio = newConfig.FindAudioConfig(configId);
+            if (oldAudio && newAudio && !AudioConfigEqual(*oldAudio, *newAudio)) {
+                std::unordered_set<int> trackIndices{ 0 };
+                for (const auto& track : oldAudio->audioTracks)
+                    trackIndices.insert(track->output_track);
+                for (const auto& track : newAudio->audioTracks)
+                    trackIndices.insert(track->output_track);
+
+                bool hasEncoder = false;
+                for (auto trackIndex : trackIndices) {
+                    auto encoderName = "multi-rtmp-aenc" + configId + "-track-idx-" + std::to_string(trackIndex);
+                    OBSEncoderAutoRelease encoder = obs_get_encoder_by_name(encoderName.c_str());
+                    if (!encoder)
+                        continue;
+                    hasEncoder = true;
+                    if (context.updatedAudioEncoderNames.insert(encoderName).second)
+                        UpdateEncoderSettings(encoder, oldAudio->encoderParams, newAudio->encoderParams, "audio encoder");
+                }
+                if (hasEncoder && busy) {
+                    context.notices.push_back(QString::fromUtf8(obs_module_text("Notice.EncoderParamsChanged"))
+                        .arg(targetName).toUtf8().toStdString());
+                }
+            }
+        }
+
+        config_ = std::move(newTarget);
+        if (!config_->tiktok.enabled && tiktokSession_.HasEndpoint())
+            EndTikTokEndpoint();
+        LoadConfig();
+        UpdateStatusDot();
+        // A running output keeps its old encoder when the config id changed;
+        // pointing its scene view at the new config's scene would mismatch.
+        if (!videoIdChanged)
+            UpdateSceneView(newConfig);
+    }
+
     void ResetInfo()
     {
         total_frames_ = 0;
@@ -1812,6 +2131,21 @@ public:
     bool IsRunning() override
     {
         return output_ != nullptr && obs_output_active(output_);
+    }
+
+    bool IsBusy() override
+    {
+        return isBusy_ || isStarting_ || restreamState_ != RestreamState::Stopped;
+    }
+
+    const std::string& GetTargetId() const override
+    {
+        return targetid_;
+    }
+
+    OutputTargetConfigPtr GetTargetConfig() const override
+    {
+        return config_;
     }
 
     bool GetEnabled() override { return config_->enabled; }
@@ -1829,7 +2163,7 @@ public:
             startRestreamWhenReady_ = false;
             isStarting_ = false;
         }
-        if (!enabled && IsRunning())
+        if (!enabled && IsBusy() && output_)
             obs_output_force_stop(output_);
         SaveMultiOutputConfig();
         UpdateStatusDot();
@@ -1837,7 +2171,7 @@ public:
 
     void StartStop()
     {
-        if (IsRunning() || restreamState_ != RestreamState::Stopped)
+        if (IsBusy())
         {
             StopStreaming();
             return;
@@ -1846,21 +2180,9 @@ public:
         StartStreaming();
     }
 
-    void Stop() { ShutdownTikTokIntegration(); }
-
-    bool ShowEditDlg() override
+    void Stop()
     {
-        std::unique_ptr<EditOutputWidget> dlg{ createEditOutputWidget(targetid_, (QMainWindow*)obs_frontend_get_main_window()) };
-
-        if (dlg->exec() == QDialog::DialogCode::Accepted)
-        {
-            if (!config_->tiktok.enabled && tiktokSession_.HasEndpoint()) EndTikTokEndpoint();
-            SaveMultiOutputConfig();
-            LoadConfig();
-            return true;
-        }
-        else
-            return false;
+        ShutdownTikTokIntegration();
     }
 
     void SetMsg(QString msg)
@@ -1876,7 +2198,6 @@ public:
         const auto state = tiktokSession_.state;
         const bool busy = state == TikTokSessionState::Authenticating ||
             state == TikTokSessionState::CreatingEndpoint || state == TikTokSessionState::EndingEndpoint;
-        edit_btn_->setEnabled(!busy);
         create_live_btn_->setEnabled(!busy && !tiktokSession_.HasEndpoint() && !endpointCreationUncertain_);
         end_live_btn_->setEnabled(state != TikTokSessionState::EndingEndpoint &&
             (tiktokSession_.HasEndpoint() || state == TikTokSessionState::CreatingEndpoint || endpointCreationUncertain_));
@@ -1902,11 +2223,9 @@ public:
             isConnecting_ = true;
             isReconnecting_ = false;
             lastErrorCode_ = 0;
-            remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
             SetMsg(obs_module_text("Status.Connecting"));
-            remove_btn_->setEnabled(false);
             UpdateStatusDot();
         });
     }
@@ -1919,7 +2238,6 @@ public:
             isStarting_ = false;
             isConnecting_ = false;
             isReconnecting_ = false;
-            remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
             SetMsg(obs_module_text("Status.Streaming"));
@@ -1938,7 +2256,6 @@ public:
             timer_->stop();
             isReconnecting_ = true;
 
-            remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
             SetMsg(obs_module_text("Status.Reconnecting"));
@@ -1950,7 +2267,6 @@ public:
     {
         QueueOutputUI([this]() {
             isReconnecting_ = false;
-            remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
             SetMsg(obs_module_text("Status.Streaming"));
@@ -1968,7 +2284,6 @@ public:
         QueueOutputUI([this]() {
             timer_->stop();
 
-            remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
             SetMsg(obs_module_text("Status.Stopping"));
@@ -1978,6 +2293,7 @@ public:
     void OnStopped(int code) override
     {
         QueueOutputUI([this, code]() {
+            isBusy_ = false;
             isStarting_ = false;
             isConnecting_ = false;
             isReconnecting_ = false;
@@ -1993,7 +2309,6 @@ public:
             ResetInfo();
             timer_->stop();
 
-            remove_btn_->setEnabled(true);
             btn_->setText(obs_module_text("Btn.Start"));
             btn_->setEnabled(true);
             SetMsg(u8"");

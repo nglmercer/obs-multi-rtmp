@@ -5,11 +5,8 @@
 #include <filesystem>
 #include <unordered_map>
 
-#include <QFileDialog>
-#include <QFile>
-#include <QIODevice>
-
 #include "push-widget.h"
+#include "edit-targets-dialog.h"
 #include "plugin-support.h"
 
 #include "output-config.h"
@@ -60,6 +57,17 @@ public:
     }
 
 protected:
+    bool eventFilter(QObject *obj, QEvent *event) override
+    {
+        // Item widgets resize themselves to the item rect, so their own size
+        // hint changes (e.g. a wrapped message) have to reach the item that
+        // hosts them, otherwise the row keeps a stale, taller height.
+        if (event->type() == QEvent::LayoutRequest && RefreshItemSizeHints())
+            updateGeometry();
+
+        return QListWidget::eventFilter(obj, event);
+    }
+
     bool event(QEvent *event) override
     {
         const bool handled = QListWidget::event(event);
@@ -70,8 +78,8 @@ protected:
         case QEvent::PolishRequest:
         case QEvent::Show:
         case QEvent::StyleChange:
-            RefreshItemSizeHints();
-            updateGeometry();
+            if (RefreshItemSizeHints())
+                updateGeometry();
             break;
         default:
             break;
@@ -81,14 +89,24 @@ protected:
     }
 
 private:
-    void RefreshItemSizeHints()
+    bool RefreshItemSizeHints()
     {
+        bool changed = false;
+
         for (int i = 0; i < count(); ++i) {
             auto item = this->item(i);
             auto widget = itemWidget(item);
-            if (item && widget)
-                item->setSizeHint(widget->sizeHint());
+            if (!item || !widget)
+                continue;
+
+            auto hint = widget->sizeHint();
+            if (item->sizeHint() != hint) {
+                item->setSizeHint(hint);
+                changed = true;
+            }
         }
+
+        return changed;
     }
 
     int ContentHeight() const
@@ -110,6 +128,42 @@ private:
     }
 };
 
+class PushWidgetItemContainer : public QWidget
+{
+    PushWidget* pushWidget_ = nullptr;
+
+public:
+    explicit PushWidgetItemContainer(QWidget* parent = nullptr)
+        : QWidget(parent)
+    {
+        auto layout = new QVBoxLayout(this);
+        layout->setContentsMargins(0, 0, 0, 0);
+        layout->setSpacing(0);
+    }
+
+    void SetPushWidget(PushWidget* pushWidget)
+    {
+        pushWidget_ = pushWidget;
+        pushWidget_->setParent(this);
+        layout()->addWidget(pushWidget_);
+    }
+
+    PushWidget* GetPushWidget() const
+    {
+        return pushWidget_;
+    }
+
+    QSize sizeHint() const override
+    {
+        return pushWidget_ ? pushWidget_->sizeHint() : QWidget::sizeHint();
+    }
+
+    QSize minimumSizeHint() const override
+    {
+        return pushWidget_ ? pushWidget_->minimumSizeHint() : QWidget::minimumSizeHint();
+    }
+};
+
 
 class MultiOutputWidget : public QWidget
 {
@@ -125,21 +179,36 @@ public:
         layout_->setSizeConstraint(QLayout::SetMinAndMaxSize);
 
         // init widget
-        auto addButton = new QPushButton(obs_module_text("Btn.NewTarget"), container_);
-        QObject::connect(addButton, &QPushButton::clicked, [this]() {
+        auto editTargetsButton = new QPushButton(obs_module_text("Btn.EditTargets"), container_);
+        QObject::connect(editTargetsButton, &QPushButton::clicked, [this]() {
             auto& global = GlobalMultiOutputConfig();
-            auto newId = GenerateId(global);
-            auto target = std::make_shared<OutputTargetConfig>();
-            target->id = newId;
-            global.targets.emplace_back(target);
-            auto pushWidget = AddPushWidget(newId);
-            if (pushWidget->ShowEditDlg()) {
-                SaveConfig();
-            } else {
-                DeletePushWidget(newId);
+            GlobalEditSnapshot snapshot;
+            for (auto widget : GetAllPushWidgets()) {
+                if (!widget->IsBusy())
+                    continue;
+
+                auto targetId = widget->GetTargetId();
+                snapshot.activeTargetIds.insert(targetId);
+                auto target = global.FindTarget(targetId);
+                if (!target)
+                    continue;
+                if (target->videoConfig && global.FindVideoConfig(*target->videoConfig))
+                    snapshot.activeVideoConfigIds.insert(*target->videoConfig);
+                if (target->audioConfig && global.FindAudioConfig(*target->audioConfig))
+                    snapshot.activeAudioConfigIds.insert(*target->audioConfig);
             }
+
+            auto result = showEditTargetsDialog(SerializeMultiOutputConfig(global), snapshot, this);
+            if (!result.has_value())
+                return;
+
+            auto edited = DeserializeMultiOutputConfig(*result);
+            if (!edited.has_value())
+                return;
+
+            ApplyEditedConfig(std::move(*edited));
         });
-        layout_->addWidget(addButton);
+        layout_->addWidget(editTargetsButton);
 
         // start all, stop all
         auto allBtnContainer = new QWidget(this);
@@ -162,6 +231,8 @@ public:
 
         // load and show outputs
         outputsContainer_ = new OutputsListWidget(container_);
+        stagingContainer_ = new QWidget(this);
+        stagingContainer_->hide();
         outputsContainer_->setDragDropMode(QAbstractItemView::InternalMove);
         outputsContainer_->setSelectionMode(QAbstractItemView::SingleSelection);
         outputsContainer_->setDropIndicatorShown(true);
@@ -194,21 +265,6 @@ public:
             &MultiOutputWidget::OnOutputMoved
         );
         layout_->addWidget(outputsContainer_);
-
-        // export / import config, so a target list (including stream keys)
-        // can be backed up or moved to another profile/PC instead of only
-        // ever living inside the current profile's obs-multi-rtmp.json
-        auto ioBtnContainer = new QWidget(this);
-        auto ioBtnLayout = new QHBoxLayout();
-        auto exportButton = new QPushButton(obs_module_text("Btn.ExportConfig"), ioBtnContainer);
-        ioBtnLayout->addWidget(exportButton);
-        auto importButton = new QPushButton(obs_module_text("Btn.ImportConfig"), ioBtnContainer);
-        ioBtnLayout->addWidget(importButton);
-        ioBtnContainer->setLayout(ioBtnLayout);
-        layout_->addWidget(ioBtnContainer);
-
-        QObject::connect(exportButton, &QPushButton::clicked, this, &MultiOutputWidget::ExportConfig);
-        QObject::connect(importButton, &QPushButton::clicked, this, &MultiOutputWidget::ImportConfig);
 
         // donate
         if (std::string("\xe5\xa4\x9a\xe8\xb7\xaf\xe6\x8e\xa8\xe6\xb5\x81") == obs_module_text("Title"))
@@ -306,17 +362,22 @@ public:
     std::list<PushWidget*> GetAllPushWidgets()
     {
         std::list<PushWidget*> result;
+        std::unordered_set<PushWidget*> seen;
         for (int row = 0; row < outputsContainer_->count(); ++row) {
             auto item = outputsContainer_->item(row);
             if (!item) {
                 continue;
             }
 
-            auto widget = outputsContainer_->itemWidget(item);
-            auto pushWidget = dynamic_cast<PushWidget*>(widget);
-            if (pushWidget) {
+            auto itemContainer = dynamic_cast<PushWidgetItemContainer*>(outputsContainer_->itemWidget(item));
+            auto pushWidget = itemContainer ? itemContainer->GetPushWidget() : nullptr;
+            if (pushWidget && seen.insert(pushWidget).second) {
                 result.push_back(pushWidget);
             }
+        }
+        for (auto pushWidget : stagedWidgets_) {
+            if (pushWidget && seen.insert(pushWidget).second)
+                result.push_back(pushWidget);
         }
         return result;
     }
@@ -324,114 +385,6 @@ public:
     void SaveConfig()
     {
         SaveMultiOutputConfig();
-    }
-
-    void ExportConfig()
-    {
-        SaveConfig();
-
-        auto fileName = QFileDialog::getSaveFileName(
-            this,
-            obs_module_text("Btn.ExportConfig"),
-            "obs-multi-rtmp-config.json",
-            "JSON (*.json)"
-        );
-        if (fileName.isEmpty())
-            return;
-        if (!fileName.endsWith(".json", Qt::CaseInsensitive))
-            fileName += ".json";
-
-        // The backup contains plain RTMP servers/keys. TikTok OAuth tokens
-        // and generated LIVE credentials are never serialized, but ordinary
-        // custom stream keys are sensitive: confirm before writing.
-        auto confirmExport = QMessageBox(
-            QMessageBox::Icon::Warning,
-            obs_module_text("Question.Title"),
-            obs_module_text("Question.ExportSensitive"),
-            QMessageBox::Yes | QMessageBox::No,
-            this
-        ).exec();
-        if (confirmExport != QMessageBox::Yes)
-            return;
-
-        auto content = SerializeMultiOutputConfig(GlobalMultiOutputConfig());
-
-        QFile file(fileName);
-        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-            QMessageBox(
-                QMessageBox::Icon::Critical,
-                obs_module_text("Notice.Title"),
-                obs_module_text("Error.ExportConfig"),
-                QMessageBox::StandardButton::Ok,
-                this
-            ).exec();
-            return;
-        }
-        file.write(content.c_str(), static_cast<qint64>(content.size()));
-    }
-
-    void ImportConfig()
-    {
-        auto fileName = QFileDialog::getOpenFileName(
-            this,
-            obs_module_text("Btn.ImportConfig"),
-            QString(),
-            "JSON (*.json)"
-        );
-        if (fileName.isEmpty())
-            return;
-
-        QFile file(fileName);
-        if (!file.open(QIODevice::ReadOnly)) {
-            QMessageBox(
-                QMessageBox::Icon::Critical,
-                obs_module_text("Notice.Title"),
-                obs_module_text("Error.ImportConfig"),
-                QMessageBox::StandardButton::Ok,
-                this
-            ).exec();
-            return;
-        }
-        auto bytes = file.readAll();
-
-        auto imported = DeserializeMultiOutputConfig(std::string(bytes.constData(), static_cast<size_t>(bytes.size())));
-        if (!imported.has_value()) {
-            QMessageBox(
-                QMessageBox::Icon::Critical,
-                obs_module_text("Notice.Title"),
-                obs_module_text("Error.ImportConfig"),
-                QMessageBox::StandardButton::Ok,
-                this
-            ).exec();
-            return;
-        }
-
-        for (auto x : GetAllPushWidgets()) {
-            if (x->IsRunning()) {
-                QMessageBox(
-                    QMessageBox::Icon::Warning,
-                    obs_module_text("Notice.Title"),
-                    obs_module_text("Error.ImportActive"),
-                    QMessageBox::StandardButton::Ok,
-                    this
-                ).exec();
-                return;
-            }
-        }
-
-        auto confirm = QMessageBox(
-            QMessageBox::Icon::Question,
-            obs_module_text("Question.Title"),
-            obs_module_text("Question.Import"),
-            QMessageBox::Yes | QMessageBox::No,
-            this
-        ).exec();
-        if (confirm != QMessageBox::Yes)
-            return;
-
-        GlobalMultiOutputConfig() = *imported;
-        SaveConfig();
-        LoadConfig();
     }
 
     void OnOutputMoved(
@@ -501,6 +454,11 @@ public:
 
     void LoadConfig()
     {
+        for (auto pushWidget : GetAllPushWidgets()) {
+            pushWidget->setParent(nullptr);
+            delete pushWidget;
+        }
+        stagedWidgets_.clear();
         outputsContainer_->clear();
 
         GlobalMultiOutputConfig() = {};
@@ -514,6 +472,84 @@ public:
         }
     }
 
+    void ApplyEditedConfig(MultiOutputConfig edited)
+    {
+        auto& global = GlobalMultiOutputConfig();
+        const MultiOutputConfig oldConfig = global;
+        const auto oldWidgets = GetAllPushWidgets();
+        GlobalConfigUpdateContext updateContext;
+
+        DetachPushWidgets();
+        for (auto pushWidget : oldWidgets)
+            pushWidget->UpdateConfig(edited, updateContext);
+
+        global = std::move(edited);
+
+        std::unordered_map<std::string, PushWidget*> widgetsById;
+        for (auto pushWidget : oldWidgets)
+            widgetsById.emplace(pushWidget->GetTargetId(), pushWidget);
+
+        for (const auto& target : global.targets) {
+            auto existing = widgetsById.find(target->id);
+            if (existing != widgetsById.end()) {
+                AttachPushWidget(existing->second);
+                widgetsById.erase(existing);
+            } else {
+                AddPushWidget(target->id);
+            }
+        }
+
+        std::vector<std::string> failedDeletes;
+        const auto remainingWidgets = stagedWidgets_;
+        for (auto pushWidget : remainingWidgets) {
+            if (!pushWidget->IsBusy()) {
+                stagedWidgets_.remove(pushWidget);
+                pushWidget->deleteLater();
+                continue;
+            }
+
+            auto target = pushWidget->GetTargetConfig();
+            if (target) {
+                global.targets.push_back(target);
+                if (target->videoConfig && !global.FindVideoConfig(*target->videoConfig)) {
+                    auto videoConfig = oldConfig.FindVideoConfig(*target->videoConfig);
+                    if (videoConfig)
+                        global.videoConfig.push_back(videoConfig);
+                }
+                if (target->audioConfig && !global.FindAudioConfig(*target->audioConfig)) {
+                    auto audioConfig = oldConfig.FindAudioConfig(*target->audioConfig);
+                    if (audioConfig)
+                        global.audioConfig.push_back(audioConfig);
+                }
+                failedDeletes.push_back(target->name);
+            }
+            AttachPushWidget(pushWidget);
+        }
+
+        SaveConfig();
+
+        std::unordered_set<std::string> shownNotices;
+        QStringList messages;
+        for (const auto& notice : updateContext.notices) {
+            if (shownNotices.insert(notice).second)
+                messages.push_back(QString::fromUtf8(notice));
+        }
+        if (!failedDeletes.empty()) {
+            messages.push_back(QString::fromUtf8(obs_module_text("Notice.DeleteFailed")));
+            for (const auto& name : failedDeletes)
+                messages.push_back(QString::fromUtf8(name));
+        }
+        if (!messages.empty()) {
+            QMessageBox(
+                QMessageBox::Icon::Information,
+                obs_module_text("Notice.Title"),
+                messages.join("\n"),
+                QMessageBox::StandardButton::Ok,
+                this
+            ).exec();
+        }
+    }
+
 private:
     // Main widget of this module's dock
     QWidget* container_ = 0;
@@ -523,59 +559,45 @@ private:
     QScrollArea scroll_;
     // Widget, that contains output source widgets
     QListWidget* outputsContainer_ = 0;
+    QWidget* stagingContainer_ = nullptr;
+    std::list<PushWidget*> stagedWidgets_;
 
-    void DeletePushWidget(const std::string& targetId)
-    {
-        // Delete from model
-        auto outputTargets = &(GlobalMultiOutputConfig().targets);
-        auto currentTarget = std::find_if(outputTargets->begin(), outputTargets->end(), [&targetId](auto& x) { return x->id == targetId; });
-        if (currentTarget == outputTargets->end()) {
-            return;
-        }
-        outputTargets->erase(currentTarget);
-
-        // Delete from List View
-        const QString id = QString::fromStdString(targetId);
-        for(auto listItem: outputsContainer_->findItems("", Qt::MatchContains)) {
-            if (listItem->data(Qt::UserRole).toString() != id) {
-                continue;
-            }
-            int row = outputsContainer_->row(listItem);
-            auto removedItem = outputsContainer_->takeItem(row);
-            auto pushWidget = outputsContainer_->itemWidget(removedItem);
-            delete removedItem;
-            if (pushWidget) {
-                pushWidget->deleteLater();
-            }
-        }
-    }
-
+    // Targets are added/removed through the "Edit Targets" dialog, which
+    // rebuilds the whole list via LoadConfig().
     PushWidget* AddPushWidget(const std::string& targetId)
     {
-        auto pushWidget = createPushWidget(targetId, outputsContainer_->viewport());
+        auto pushWidget = createPushWidget(targetId, stagingContainer_);
+        AttachPushWidget(pushWidget);
+        return pushWidget;
+    }
+
+    void DetachPushWidgets()
+    {
+        for (auto pushWidget : GetAllPushWidgets()) {
+            if (pushWidget->parentWidget() == stagingContainer_)
+                continue;
+            pushWidget->setParent(stagingContainer_);
+            stagedWidgets_.push_back(pushWidget);
+        }
+        outputsContainer_->clear();
+    }
+
+    void AttachPushWidget(PushWidget* pushWidget)
+    {
+        if (!pushWidget)
+            return;
+
+        stagedWidgets_.remove(pushWidget);
+        auto shell = new PushWidgetItemContainer(outputsContainer_->viewport());
+        shell->SetPushWidget(pushWidget);
 
         QListWidgetItem* listItem = new QListWidgetItem();
-        listItem->setData(Qt::UserRole, QString::fromStdString(targetId));
-        listItem->setSizeHint(pushWidget->sizeHint());
+        listItem->setData(Qt::UserRole, QString::fromStdString(pushWidget->GetTargetId()));
+        listItem->setSizeHint(shell->sizeHint());
         outputsContainer_->addItem(listItem);
-        outputsContainer_->setItemWidget(listItem, pushWidget);
-
-        QObject::connect(pushWidget->GetDeleteButton(), &QPushButton::clicked, [this, targetId]() {
-            auto msgbox = new QMessageBox(
-                QMessageBox::Icon::Question,
-                obs_module_text("Question.Title"),
-                obs_module_text("Question.Delete"),
-                QMessageBox::Yes | QMessageBox::No,
-                this
-            );
-            if (msgbox->exec() != QMessageBox::Yes) {
-                return;
-            }
-            DeletePushWidget(targetId);
-            SaveConfig();
-        });
-
-        return pushWidget;
+        outputsContainer_->setItemWidget(listItem, shell);
+        shell->installEventFilter(outputsContainer_);
+        pushWidget->installEventFilter(outputsContainer_);
     }
 };
 

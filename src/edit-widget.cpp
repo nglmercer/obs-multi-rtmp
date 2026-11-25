@@ -18,6 +18,8 @@
 #include <QScreen>
 #include <QGuiApplication>
 #include <QWindow>
+#include <QStandardItemModel>
+#include <QSignalBlocker>
 
 #include <regex>
 
@@ -73,24 +75,104 @@ static obs_properties* AddBF(obs_properties* p) {
 }
 
 
-class EditOutputWidgetImpl: public EditOutputWidget
+class ContentSizeTabWidget: public QTabWidget {
+public:
+    using QTabWidget::QTabWidget;
+
+    QSize sizeHint() const override {
+        return CalculateTabSize([](QWidget* widget) { return widget->sizeHint(); });
+    }
+
+    QSize minimumSizeHint() const override {
+        return CalculateTabSize([](QWidget* widget) { return widget->minimumSizeHint(); });
+    }
+
+private:
+    template<class T>
+    QSize CalculateTabSize(T getWidgetSize) const {
+        auto current = currentWidget();
+        auto bar = tabBar();
+        if (!current || !bar)
+            return QTabWidget::sizeHint();
+
+        auto pageSize = getWidgetSize(current);
+        if (!pageSize.isValid())
+            pageSize = current->sizeHint();
+
+        auto tabSize = bar->sizeHint();
+        auto result = pageSize;
+        switch (tabPosition()) {
+        case QTabWidget::West:
+        case QTabWidget::East:
+            result.rwidth() += tabSize.width();
+            result.setHeight((std::max)(result.height(), tabSize.height()));
+            break;
+        case QTabWidget::North:
+        case QTabWidget::South:
+        default:
+            result.setWidth((std::max)(result.width(), tabSize.width()));
+            result.rheight() += tabSize.height();
+            break;
+        }
+
+        const int frame = style()->pixelMetric(QStyle::PM_DefaultFrameWidth, nullptr, this) * 2;
+        result.rwidth() += frame;
+        result.rheight() += frame;
+        return result;
+    }
+};
+
+class ContentSizeScrollArea: public QScrollArea {
+public:
+    using QScrollArea::QScrollArea;
+
+    QSize sizeHint() const override {
+        auto hint = viewportSizeHint();
+        if (!hint.isValid())
+            return QScrollArea::sizeHint();
+
+        const int frame = frameWidth() * 2;
+        hint.rwidth() += frame;
+        hint.rheight() += frame;
+        return hint;
+    }
+
+    QSize minimumSizeHint() const override {
+        return QScrollArea::minimumSizeHint();
+    }
+
+protected:
+    QSize viewportSizeHint() const override {
+        auto content = widget();
+        if (!content)
+            return QScrollArea::viewportSizeHint();
+
+        if (auto contentLayout = content->layout()) {
+            auto hint = contentLayout->sizeHint();
+            if (hint.isValid())
+                return hint;
+        }
+
+        auto hint = content->sizeHint();
+        if (hint.isValid())
+            return hint;
+
+        return QScrollArea::viewportSizeHint();
+    }
+};
+
+
+
+class EditTargetPanelImpl: public EditTargetPanel
 {
-    // Stable-size dialog: per-tab scrolling, no content-driven top-level
-    // resize. Each tab page is wrapped in its own QScrollArea with
-    // widgetResizable=true; the top-level QTabWidget + QDialogButtonBox
-    // keep a fixed initial size clamped to the screen.
+    MultiOutputConfig& globalConfig_;
+    const GlobalEditSnapshot* snapshot_ = nullptr;
+    OutputTargetConfigPtr config_ = nullptr;
+    std::function<void()> onContentSizeChanged_;
     QTabWidget* topTabs_ = nullptr;
     QTabWidget* outputSettingsTabs_ = nullptr;
-    QDialogButtonBox* buttons_ = nullptr;
 
-    std::string targetid_;
-    OutputTargetConfigPtr config_ = nullptr;
-    // Transactional draft: every widget edits this copy plus the staged
-    // encoder configs below. GlobalMultiOutputConfig() is untouched until
-    // Apply/OK commits; Cancel/Escape discards everything.
-    std::list<VideoEncoderConfigPtr> draftVideos_;
-    std::list<AudioEncoderConfigPtr> draftAudios_;
-    // True when the dialog opened a target with no saved encoder choice at
+    // True when the panel opened a target with no saved encoder choice at
     // all (i.e. a brand-new target). Only such targets get the independent
     // TikTok preset; existing saved choices are never rewritten here.
     bool freshTarget_ = false;
@@ -107,21 +189,23 @@ class EditOutputWidgetImpl: public EditOutputWidget
             layout_ = new QGridLayout(this);
             layout_->setColumnStretch(0, 1);
             layout_->setContentsMargins(0, 0, 0, 0);
-            setLayout(layout_);
+            layout_->setSizeConstraint(QLayout::SetMinAndMaxSize);
         }
 
-        // owner of props and settings is transfered
-        void UpdateProperties(obs_properties* props, obs_data* settings) {
+        // owner of props and settings is transfered to the created widget
+        void UpdateProperties(OBSPropertiesPtr props, obs_data* settings) {
             ResetWid();
-            wid_ = createPropertyWidget(props, settings_ = settings, this);
+            wid_ = createPropertyWidget(std::move(props), settings_ = settings, this);
             layout_->addWidget(wid_, 0, 0, 1, 1, Qt::AlignTop);
-            obs_data_release(settings);
+            wid_->SetGeometryChangeCallback(onContentSizeChanged_);
+            NotifyContentSizeChanged();
         }
 
         void ClearProperties() {
             ResetWid();
             placeholder_ = new QWidget(this);
             layout_->addWidget(placeholder_, 0, 0, 1, 1);
+            NotifyContentSizeChanged();
         }
 
         nlohmann::json Save() {
@@ -140,13 +224,29 @@ class EditOutputWidgetImpl: public EditOutputWidget
 
         void ResetWid() {
             if (wid_) {
-                delete wid_;
+                // Destroy the old property widget outside of the current
+                // event handler. Tearing down OBS property widgets in the
+                // middle of a button/list signal can crash Qt while child
+                // widgets are being removed.
+                layout_->removeWidget(wid_);
+                wid_->hide();
+                wid_->deleteLater();
                 wid_ = nullptr;
             }
             if (placeholder_) {
-                delete placeholder_;
+                layout_->removeWidget(placeholder_);
+                placeholder_->hide();
+                placeholder_->deleteLater();
                 placeholder_ = nullptr;
             }
+        }
+
+        void NotifyContentSizeChanged() {
+            layout_->activate();
+            updateGeometry();
+            adjustSize();
+            if (onContentSizeChanged_)
+                onContentSizeChanged_();
         }
     };
 
@@ -214,28 +314,16 @@ class EditOutputWidgetImpl: public EditOutputWidget
     }
 
 
-    // Draft-scoped duplication: the clone lives in the dialog's staged
-    // lists and reaches GlobalMultiOutputConfig() only on Apply/OK, so
-    // Cancel leaves every other destination untouched.
+    // "Share from another destination" clones or reuses a *plugin config*
+    // id. This is distinct from sharing a live OBS encoder instance. The
+    // caller owns whether globalConfig_ is a dialog draft or live config.
     template<class T>
-    static std::optional<std::string> DuplicateConfig(std::list<T>& list, std::string oldid) {
+    static std::optional<std::string> DuplicateConfig(MultiOutputConfig& global, std::list<T>& list, std::string oldid) {
         auto cfg = FindById(list, oldid);
         if (!cfg) {
             return {};
         }
-        auto& global = GlobalMultiOutputConfig();
-        auto newid = GenerateId(global);
-        // Avoid colliding with ids already staged in this dialog.
-        for (bool clash = true; clash;) {
-            clash = false;
-            for (auto &x : list) {
-                if (x->id == newid) {
-                    newid = GenerateId(global);
-                    clash = true;
-                    break;
-                }
-            }
-        }
+        auto newid = global.GenerateId();
         auto newcfg = std::make_shared<typename T::element_type>(*cfg);
         newcfg->id = newid;
         list.push_back(newcfg);
@@ -248,16 +336,16 @@ class EditOutputWidgetImpl: public EditOutputWidget
     // work happens on the dialog draft; Apply/OK commits, Cancel discards.
     void PopupShareMenu(bool isAudio) {
         auto menu = new QMenu(this);
-        auto& global = GlobalMultiOutputConfig();
+        auto& global = globalConfig_;
 
         {
             auto action = menu->addAction(obs_module_text("NoShare"));
-            QObject::connect(action, &QAction::triggered, [=]() {
+            QObject::connect(action, &QAction::triggered, [&]() {
                 if (isAudio) {
                     if (!config_->audioConfig.has_value() ||
                         IsSpecialEncoder(*config_->audioConfig))
                         return;
-                    auto newid = DuplicateConfig(draftAudios_, *config_->audioConfig);
+                    auto newid = DuplicateConfig(global, global.audioConfig, *config_->audioConfig);
                     if (!newid.has_value())
                         return;
                     config_->audioConfig = *newid;
@@ -266,7 +354,7 @@ class EditOutputWidgetImpl: public EditOutputWidget
                     if (!config_->videoConfig.has_value() ||
                         IsSpecialEncoder(*config_->videoConfig))
                         return;
-                    auto newid = DuplicateConfig(draftVideos_, *config_->videoConfig);
+                    auto newid = DuplicateConfig(global, global.videoConfig, *config_->videoConfig);
                     if (!newid.has_value())
                         return;
                     config_->videoConfig = *newid;
@@ -309,8 +397,10 @@ class EditOutputWidgetImpl: public EditOutputWidget
         menu->exec(QCursor::pos());
     }
 
-    // No content-driven top-level resize: the dialog keeps a stable size.
-    void ScheduleResizeToContent() {}
+    void NotifyContentSizeChanged() {
+        if (onContentSizeChanged_)
+            onContentSizeChanged_();
+    }
 
     QScrollArea *WrapInScroll(QWidget *page)
     {
@@ -324,18 +414,18 @@ class EditOutputWidgetImpl: public EditOutputWidget
     }
 
     QTabWidget* CreateOutputSettingsWidget(QWidget* parent) {
-        auto tab = outputSettingsTabs_ = new QTabWidget(parent);
+        auto tab = outputSettingsTabs_ = new ContentSizeTabWidget(parent);
 
         // service
         {
-            serviceSettings_ = new PropertiesWidget([]() {}, tab);
+            serviceSettings_ = new PropertiesWidget([this]() { NotifyContentSizeChanged(); }, tab);
             updateServiceTab();
             tab->addTab(serviceSettings_, obs_module_text("Tab.Service"));
         }
 
         // output
         {
-            outputSettings_ = new PropertiesWidget([]() {}, tab);
+            outputSettings_ = new PropertiesWidget([this]() { NotifyContentSizeChanged(); }, tab);
             updateOutputTab();
             tab->addTab(outputSettings_, obs_module_text("Tab.Output"));
         }
@@ -354,11 +444,15 @@ class EditOutputWidgetImpl: public EditOutputWidget
             protocol_info = GetProtocolInfos()->GetList();
         }
 
-        auto service = obs_service_create(protocol_info->serviceId, ("tmp_service_" + targetid_).c_str(), from_json(config_->serviceParam), nullptr);
+        auto service = obs_service_create(protocol_info->serviceId, ("tmp_service_" + config_->id).c_str(), from_json(config_->serviceParam), nullptr);
+        OBSPropertiesPtr properties(obs_service_properties(service), [service](obs_properties_t* properties) {
+            if (properties)
+                obs_properties_destroy(properties);
+            obs_service_release(service);
+        });
         serviceSettings_->UpdateProperties(
-            obs_service_properties(service),
+            std::move(properties),
             obs_service_get_settings(service));
-        obs_service_release(service);
     }
 
     void updateOutputTab()
@@ -370,20 +464,28 @@ class EditOutputWidgetImpl: public EditOutputWidget
             protocol_info = GetProtocolInfos()->GetList();
         }
 
-        auto output = obs_output_create(protocol_info->outputId, ("tmp_output_" + targetid_).c_str(), from_json(config_->outputParam), nullptr);
+        auto output = obs_output_create(protocol_info->outputId, ("tmp_output_" + config_->id).c_str(), from_json(config_->outputParam), nullptr);
+        OBSPropertiesPtr properties(obs_output_properties(output), [output](obs_properties_t* properties) {
+            if (properties)
+                obs_properties_destroy(properties);
+            obs_output_release(output);
+        });
         outputSettings_->UpdateProperties(
-            obs_output_properties(output),
+            std::move(properties),
             obs_output_get_settings(output));
         supported_audio_encoders_ = obs_output_get_supported_audio_codecs(output);
         supported_video_encoders_ = obs_output_get_supported_video_codecs(output);
-        obs_output_release(output);
 
-        if (aenc_ && venc_)
+        if (aenc_ && venc_) {
+            // LoadEncoders() no longer touches the config, sync UI explicitly.
             LoadEncoders();
+            LoadConfig();
+            UpdateUI();
+        }
     }
 
 public:
-    ~EditOutputWidgetImpl() override
+    ~EditTargetPanelImpl() override
     {
         // Orphan in-flight category searches: their completions are
         // dropped while workers finish harmlessly on pool threads.
@@ -400,86 +502,23 @@ public:
         box->addItem(obs_module_text("Encoder.Custom"), "custom");
     }
 
-    // Atomically commit the draft target + staged encoder configs.
-    bool CommitDraft()
+    EditTargetPanelImpl(
+        MultiOutputConfig& globalConfig,
+        OutputTargetConfigPtr config,
+        std::function<void()> onContentSizeChanged,
+        const GlobalEditSnapshot* snapshot,
+        QWidget* parent = 0)
+        : QWidget(parent)
+        , globalConfig_(globalConfig)
+        , snapshot_(snapshot)
+        , config_(std::move(config))
+        , onContentSizeChanged_(std::move(onContentSizeChanged))
     {
-        SaveConfig();
-        auto &global = GlobalMultiOutputConfig();
-        auto it = FindById(global.targets, config_->id);
-        if (it == nullptr)
-            return false;
-        *it = *config_;
-        // Upsert staged encoder configs; never touch unrelated ids.
-        for (auto &staged : draftVideos_) {
-            auto cur = FindById(global.videoConfig, staged->id);
-            if (cur)
-                *cur = *staged;
-            else
-                global.videoConfig.push_back(staged);
-        }
-        for (auto &staged : draftAudios_) {
-            auto cur = FindById(global.audioConfig, staged->id);
-            if (cur)
-                *cur = *staged;
-            else
-                global.audioConfig.push_back(staged);
-        }
-        SaveMultiOutputConfig();
-        return true;
-    }
-
-    void ApplyStableDialogSize()
-    {
-        QSize initial(820, 640);
-        QSettings settings("obs-multi-rtmp", "EditDialog");
-        QVariant saved = settings.value("size");
-        if (saved.isValid()) {
-            QSize s = saved.toSize();
-            if (s.width() >= 640 && s.width() <= 1600 && s.height() >= 480 && s.height() <= 1200)
-                initial = s;
-        }
-        QScreen *scr = QGuiApplication::primaryScreen();
-        if (windowHandle() && windowHandle()->screen())
-            scr = windowHandle()->screen();
-        if (scr) {
-            QSize avail = scr->availableGeometry().size();
-            // Keep window decorations and small screens (1366x768) usable.
-            const int margin = 60;
-            QSize maxSize((std::max)(640, avail.width() - margin),
-                          (std::max)(480, avail.height() - margin));
-            initial = initial.boundedTo(maxSize);
-        }
-        resize(initial);
-    }
-
-    void SaveDialogSize()
-    {
-        QSettings settings("obs-multi-rtmp", "EditDialog");
-        settings.setValue("size", size());
-    }
-
-    EditOutputWidgetImpl(const std::string& targetid, QWidget* parent = 0)
-        : QDialog(parent)
-        , targetid_(targetid)
-    {
-        auto& global = GlobalMultiOutputConfig();
-        auto orig = FindById(global.targets, targetid_);
-        if (orig == nullptr) {
-            return;
-        }
-        config_ = std::make_shared<OutputTargetConfig>(*orig);
-        // Deep-copy encoder configs into the draft so Cancel discards all
-        // edits, shares, and duplicates without touching global state.
-        for (auto &v : global.videoConfig)
-            draftVideos_.push_back(std::make_shared<VideoEncoderConfig>(*v));
-        for (auto &a : global.audioConfig)
-            draftAudios_.push_back(std::make_shared<AudioEncoderConfig>(*a));
+        setSizePolicy(QSizePolicy::Policy::Preferred, QSizePolicy::Policy::Preferred);
         freshTarget_ = !config_->videoConfig.has_value() && !config_->audioConfig.has_value();
 
-        setWindowTitle(obs_module_text("StreamingSettings"));
-
         auto fullLayout = new QVBoxLayout(this);
-        topTabs_ = new QTabWidget(this);
+        topTabs_ = new ContentSizeTabWidget(this);
         fullLayout->addWidget(topTabs_, 1);
 
         // ---- Destino ----
@@ -536,7 +575,7 @@ public:
                 encLayout->addWidget(new QLabel(obs_module_text("VideoFPSDenumerator"), videoCustomBox_), currow, 0);
                 encLayout->addWidget(v_fpsdenumerator_ = new QComboBox(videoCustomBox_), currow, 1);
                 ++currow;
-                encLayout->addWidget(videoEncoderSettings_ = new PropertiesWidget([]() {}, videoCustomBox_), currow, 0, 1, 2);
+                encLayout->addWidget(videoEncoderSettings_ = new PropertiesWidget([this]() { NotifyContentSizeChanged(); }, videoCustomBox_), currow, 0, 1, 2);
                 videoCustomBox_->setLayout(encLayout);
             }
             layout->addWidget(videoCustomBox_);
@@ -588,7 +627,7 @@ public:
                 for(int i = 1; i <= NUM_MIXER_TRACKS; ++i)
                     a_vod_track_->addItem(QString(std::to_string(i).c_str()), i - 1);
                 ++currow;
-                encLayout->addWidget(audioEncoderSettings_ = new PropertiesWidget([]() {}, audioCustomBox_), currow, 0, 1, 2);
+                encLayout->addWidget(audioEncoderSettings_ = new PropertiesWidget([this]() { NotifyContentSizeChanged(); }, audioCustomBox_), currow, 0, 1, 2);
                 audioCustomBox_->setLayout(encLayout);
             }
             layout->addWidget(audioCustomBox_);
@@ -667,27 +706,6 @@ public:
             topTabs_->addTab(WrapInScroll(page), obs_module_text("Tab.Advanced"));
         }
 
-        buttons_ = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel |
-                                        QDialogButtonBox::Apply,
-                                        this);
-        buttons_->button(QDialogButtonBox::Ok)->setText(obs_module_text("OK"));
-        buttons_->button(QDialogButtonBox::Cancel)->setText(obs_module_text("Btn.Cancel"));
-        buttons_->button(QDialogButtonBox::Apply)->setText(obs_module_text("Btn.Apply"));
-        QObject::connect(buttons_, &QDialogButtonBox::accepted, [this]() {
-            if (CommitDraft()) {
-                SaveDialogSize();
-                done(DialogCode::Accepted);
-            }
-        });
-        QObject::connect(buttons_, &QDialogButtonBox::rejected, [this]() {
-            reject();
-        });
-        QObject::connect(buttons_->button(QDialogButtonBox::Apply), &QPushButton::clicked, [this]() {
-            CommitDraft();
-        });
-        fullLayout->addWidget(buttons_);
-        setLayout(fullLayout);
-
         FillModeBox(videoMode_);
         FillModeBox(audioMode_);
         LoadProtocols();
@@ -698,7 +716,7 @@ public:
         LoadConfig();
         ConnectWidgetSignals();
         UpdateUI();
-        ApplyStableDialogSize();
+        NotifyContentSizeChanged();
     }
 
     void ConnectWidgetSignals()
@@ -719,6 +737,9 @@ public:
             SaveConfig();
             LoadConfig();
             UpdateUI();
+        });
+        QObject::connect(v_scene_, (void (QComboBox::*)(int)) &QComboBox::currentIndexChanged, [this]() {
+            UpdateSceneModeLock();
         });
         QObject::connect(aenc_, (void (QComboBox::*)(int)) &QComboBox::currentIndexChanged, [this](){
             SaveConfig();
@@ -763,6 +784,9 @@ public:
         {
             // Video encoders: custom ids only. Share/Copy modes live in the
             // Mode selector above; they are not encoder choices here.
+            // Rebuilding emits currentIndexChanged; the handler would then
+            // rewrite the config id and break encoder sharing.
+            QSignalBlocker blocker(venc_);
             auto old_venc = venc_->currentData();
             std::sregex_token_iterator it(supported_video_encoders_.begin(), supported_video_encoders_.end(), sp, -1), itend;
             venc_->clear();
@@ -780,6 +804,7 @@ public:
 
         {
             // Audio encoders: custom ids only (see above).
+            QSignalBlocker blocker(aenc_);
             auto old_aenc = aenc_->currentData();
             std::sregex_token_iterator it(supported_audio_encoders_.begin(), supported_audio_encoders_.end(), sp, -1), itend;
             aenc_->clear();
@@ -933,6 +958,63 @@ public:
             a_share_notify_->setText(QString::fromUtf8(
                 obs_module_text("EncoderShare") + makeShareNotify(sharedAudioTargets)));
         }
+
+        UpdateSceneModeLock();
+        UpdateEncoderEditability();
+    }
+
+    void UpdateSceneModeLock()
+    {
+        auto model = qobject_cast<QStandardItemModel*>(v_scene_->model());
+        if (!model)
+            return;
+
+        bool locked = false;
+        if (snapshot_) {
+            locked = snapshot_->activeTargetIds.find(config_->id) != snapshot_->activeTargetIds.end();
+            if (config_->videoConfig) {
+                locked = locked || snapshot_->activeVideoConfigIds.find(*config_->videoConfig)
+                    != snapshot_->activeVideoConfigIds.end();
+            }
+        }
+
+        const bool usesObsScene = v_scene_->currentIndex() == 0;
+        for (int row = 0; row < model->rowCount(); ++row) {
+            auto item = model->item(row);
+            if (!item)
+                continue;
+            auto flags = item->flags();
+            if (locked && ((row == 0) != usesObsScene))
+                flags &= ~Qt::ItemIsEnabled;
+            else
+                flags |= Qt::ItemIsEnabled;
+            item->setFlags(flags);
+        }
+    }
+
+    void UpdateEncoderEditability()
+    {
+        const bool targetIsActive = snapshot_
+            && snapshot_->activeTargetIds.find(config_->id) != snapshot_->activeTargetIds.end();
+
+        bool videoConfigIsActive = false;
+        if (snapshot_ && config_->videoConfig) {
+            videoConfigIsActive = snapshot_->activeVideoConfigIds.find(*config_->videoConfig)
+                != snapshot_->activeVideoConfigIds.end();
+        }
+
+        bool audioConfigIsActive = false;
+        if (snapshot_ && config_->audioConfig) {
+            audioConfigIsActive = snapshot_->activeAudioConfigIds.find(*config_->audioConfig)
+                != snapshot_->activeAudioConfigIds.end();
+        }
+
+        const bool videoLocked = targetIsActive || videoConfigIsActive;
+        const bool audioLocked = targetIsActive || audioConfigIsActive;
+        videoMode_->setEnabled(!videoLocked);
+        venc_->setEnabled(!videoLocked);
+        audioMode_->setEnabled(!audioLocked);
+        aenc_->setEnabled(!audioLocked);
     }
 
     std::vector<std::string> GetEncoderShareTargets(bool isAudio) {
@@ -953,7 +1035,7 @@ public:
 	    }
 
         std::vector<std::string> ret;
-        auto& global = GlobalMultiOutputConfig();
+        auto& global = globalConfig_;
         for(auto& x: global.targets) {
             if (isAudio) {
                 if (x->id != config_->id && x->audioConfig.has_value() && *x->audioConfig == configId)
@@ -973,9 +1055,9 @@ public:
         if (!config_->videoConfig.has_value() || IsSpecialEncoder(*config_->videoConfig))
             return;
 
-        auto it = FindById(draftVideos_, *config_->videoConfig);
+        auto it = globalConfig_.FindVideoConfig(*config_->videoConfig);
         if (it == nullptr) {
-            auto new_item = draftVideos_.emplace_back(new VideoEncoderConfig{});
+            auto new_item = globalConfig_.videoConfig.emplace_back(new VideoEncoderConfig{});
             it = new_item;
         }
         it->id = *config_->videoConfig;
@@ -1001,9 +1083,9 @@ public:
         if (!config_->audioConfig.has_value() || IsSpecialEncoder(*config_->audioConfig))
             return;
 
-        auto it = FindById(draftAudios_, *config_->audioConfig);
+        auto it = globalConfig_.FindAudioConfig(*config_->audioConfig);
         if (it == nullptr) {
-            auto new_item = draftAudios_.emplace_back(new AudioEncoderConfig{});
+            auto new_item = globalConfig_.audioConfig.emplace_back(new AudioEncoderConfig{});
             it = new_item;
         }
         it->id = *config_->audioConfig;
@@ -1023,9 +1105,9 @@ public:
         }
     }
 
-    void SaveConfig()
+    void SaveConfig() override
     {
-        auto& global = GlobalMultiOutputConfig();
+        auto& global = globalConfig_;
 
         config_->name = tostdu8(name_->text());
         if (protocolSelector_->currentIndex() >= 0)
@@ -1053,7 +1135,7 @@ public:
                 if (venc_ && venc_->currentData().isValid()) {
                     if (!config_->videoConfig.has_value() ||
                         IsSpecialEncoder(*config_->videoConfig))
-                        config_->videoConfig = GenerateId(global);
+                        config_->videoConfig = global.GenerateId();
                     SaveVideoConfig();
                 } else if (!config_->videoConfig.has_value() ||
                            IsSpecialEncoder(*config_->videoConfig)) {
@@ -1075,7 +1157,7 @@ public:
                 if (aenc_ && aenc_->currentData().isValid()) {
                     if (!config_->audioConfig.has_value() ||
                         IsSpecialEncoder(*config_->audioConfig))
-                        config_->audioConfig = GenerateId(global);
+                        config_->audioConfig = global.GenerateId();
                     SaveAudioConfig();
                 } else if (!config_->audioConfig.has_value() ||
                            IsSpecialEncoder(*config_->audioConfig)) {
@@ -1151,7 +1233,7 @@ public:
             [result, gen, epoch = client->authEpoch()](const std::shared_ptr<TikTokJobContext> &job) {
                 // dynamic_cast: QObject is a virtual base of QWidget, so
                 // static_cast cannot downcast here.
-                auto *self = dynamic_cast<EditOutputWidgetImpl *>(job->receiver.data());
+                auto *self = dynamic_cast<EditTargetPanelImpl *>(job->receiver.data());
                 if (self == nullptr)
                     return;
                 self->ApplyTikTokCategories(gen, *result, epoch);
@@ -1229,12 +1311,16 @@ public:
         }
 
         {
-            auto encoder = obs_video_encoder_create(config.encoderId.c_str(), ("tmp_video_encoder_" + targetid_ + "_" + config.id).c_str(), from_json(config.encoderParams), nullptr);
+            auto encoder = obs_video_encoder_create(config.encoderId.c_str(), ("tmp_video_encoder_" + config_->id + "_" + config.id).c_str(), from_json(config.encoderParams), nullptr);
+            OBSPropertiesPtr properties(AddBF(obs_encoder_properties(encoder)), [encoder](obs_properties_t* properties) {
+                if (properties)
+                    obs_properties_destroy(properties);
+                obs_encoder_release(encoder);
+            });
             videoEncoderSettings_->UpdateProperties(
-                AddBF(obs_encoder_properties(encoder)),
+                std::move(properties),
                 obs_encoder_get_settings(encoder)
             );
-            obs_encoder_release(encoder);
         }
     }
 
@@ -1280,12 +1366,16 @@ public:
         }
 
         {
-            auto encoder = obs_audio_encoder_create(config.encoderId.c_str(), ("tmp_audio_encoder_" + targetid_ + "_" + config.id).c_str(), from_json(config.encoderParams), 0, nullptr);
+            auto encoder = obs_audio_encoder_create(config.encoderId.c_str(), ("tmp_audio_encoder_" + config_->id + "_" + config.id).c_str(), from_json(config.encoderParams), 0, nullptr);
+            OBSPropertiesPtr properties(obs_encoder_properties(encoder), [encoder](obs_properties_t* properties) {
+                if (properties)
+                    obs_properties_destroy(properties);
+                obs_encoder_release(encoder);
+            });
             audioEncoderSettings_->UpdateProperties(
-                obs_encoder_properties(encoder),
+                std::move(properties),
                 obs_encoder_get_settings(encoder)
             );
-            obs_encoder_release(encoder);
         }
     }
 
@@ -1365,14 +1455,14 @@ public:
         if (!config_->videoConfig.has_value() || IsSpecialEncoder(*config_->videoConfig)) {
             videoEncoderSettings_->ClearProperties();
         } else {
-            auto it = FindById(draftVideos_, *config_->videoConfig);
+            auto it = globalConfig_.FindVideoConfig(*config_->videoConfig);
             LoadVideoConfig(it ? it.get() : nullptr);
         }
 
         if (!config_->audioConfig.has_value() || IsSpecialEncoder(*config_->audioConfig)) {
             audioEncoderSettings_->ClearProperties();
         } else {
-            auto it = FindById(draftAudios_, *config_->audioConfig);
+            auto it = globalConfig_.FindAudioConfig(*config_->audioConfig);
             LoadAudioConfig(it ? it.get() : nullptr);
         }
 
@@ -1383,6 +1473,102 @@ public:
     }
 };
 
+
+// The original single-target dialog wraps the reusable panel and provides a
+// transactional draft for encoder configs: Cancel discards everything, OK or
+// Apply upserts only the target and encoder configs touched by the panel.
+class EditOutputWidgetImpl: public EditOutputWidget
+{
+    MultiOutputConfig draftConfig_;
+    OutputTargetConfigPtr config_ = nullptr;
+    EditTargetPanel* panel_ = nullptr;
+    QDialogButtonBox* buttons_ = nullptr;
+
+    static MultiOutputConfig CloneConfig(const MultiOutputConfig& source)
+    {
+        MultiOutputConfig copy;
+        for (auto& target : source.targets)
+            copy.targets.push_back(std::make_shared<OutputTargetConfig>(*target));
+        for (auto& video : source.videoConfig)
+            copy.videoConfig.push_back(std::make_shared<VideoEncoderConfig>(*video));
+        for (auto& audio : source.audioConfig)
+            copy.audioConfig.push_back(std::make_shared<AudioEncoderConfig>(*audio));
+        return copy;
+    }
+
+    bool CommitDraft()
+    {
+        panel_->SaveConfig();
+        auto& global = GlobalMultiOutputConfig();
+        auto target = global.FindTarget(config_->id);
+        if (!target)
+            return false;
+
+        *target = *config_;
+        for (auto& staged : draftConfig_.videoConfig) {
+            auto current = global.FindVideoConfig(staged->id);
+            if (current)
+                *current = *staged;
+            else
+                global.videoConfig.push_back(staged);
+        }
+        for (auto& staged : draftConfig_.audioConfig) {
+            auto current = global.FindAudioConfig(staged->id);
+            if (current)
+                *current = *staged;
+            else
+                global.audioConfig.push_back(staged);
+        }
+        SaveMultiOutputConfig();
+        return true;
+    }
+
+public:
+    EditOutputWidgetImpl(const std::string& targetid, QWidget* parent = 0)
+        : QDialog(parent)
+    {
+        auto& global = GlobalMultiOutputConfig();
+        draftConfig_ = CloneConfig(global);
+        config_ = draftConfig_.FindTarget(targetid);
+        if (!config_)
+            return;
+
+        setWindowTitle(obs_module_text("StreamingSettings"));
+        auto layout = new QVBoxLayout(this);
+        panel_ = createEditTargetPanel(draftConfig_, config_, []() {}, this);
+        layout->addWidget(panel_, 1);
+
+        buttons_ = new QDialogButtonBox(
+            QDialogButtonBox::Ok | QDialogButtonBox::Cancel | QDialogButtonBox::Apply,
+            this);
+        buttons_->button(QDialogButtonBox::Ok)->setText(obs_module_text("OK"));
+        buttons_->button(QDialogButtonBox::Cancel)->setText(obs_module_text("Btn.Cancel"));
+        buttons_->button(QDialogButtonBox::Apply)->setText(obs_module_text("Btn.Apply"));
+        QObject::connect(buttons_, &QDialogButtonBox::accepted, [this]() {
+            if (CommitDraft())
+                done(DialogCode::Accepted);
+        });
+        QObject::connect(buttons_, &QDialogButtonBox::rejected, [this]() {
+            reject();
+        });
+        QObject::connect(buttons_->button(QDialogButtonBox::Apply), &QPushButton::clicked, [this]() {
+            CommitDraft();
+        });
+        layout->addWidget(buttons_);
+        resize(820, 640);
+    }
+};
+
+
+EditTargetPanel* createEditTargetPanel(
+    MultiOutputConfig& config,
+    OutputTargetConfigPtr target,
+    std::function<void()> onContentSizeChanged,
+    QWidget* parent,
+    const GlobalEditSnapshot* snapshot)
+{
+    return new EditTargetPanelImpl(config, std::move(target), std::move(onContentSizeChanged), snapshot, parent);
+}
 
 EditOutputWidget* createEditOutputWidget(const std::string& targetid, QWidget* parent) {
     return new EditOutputWidgetImpl(targetid, parent);

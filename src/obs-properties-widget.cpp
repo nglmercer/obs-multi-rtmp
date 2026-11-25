@@ -91,7 +91,7 @@ namespace {
             auto str = obs_property_description(p);
             if (!str)
                 str = obs_property_name(p);
-            label = new QLabel(QString::fromUtf8(str, strlen(str)));
+            label = new QLabel(QString::fromUtf8(str, strlen(str)), parent);
 
             switch(propType = obs_property_get_type(p)) {
                 case OBS_PROPERTY_BOOL: {
@@ -177,7 +177,13 @@ namespace {
                                 data = LoadCString(obs_property_list_item_string(p, i));
                             cb->addItem(LoadCString(itemname), data);
                         }
+                        break;
                     }
+                    case OBS_PROPERTY_BOOL:
+                    case OBS_PROPERTY_INT:
+                    case OBS_PROPERTY_FLOAT:
+                    case OBS_PROPERTY_TEXT:
+                        break;
                     default:
                         blog(LOG_WARNING, "ReloadProperty did not handle property of type %d", propType);
                         break;
@@ -288,15 +294,15 @@ namespace {
 
     class QPropertiesWidgetImpl: virtual public QWidget, public QPropertiesWidget, public UpdateHandler {
         std::unordered_map<std::string, std::shared_ptr<PropertyWidget>> propwids;
-        obs_properties* props;
+        OBSPropertiesPtr props;
         OBSData settings;
         OBSData orig_settings;
         std::function<void()> geometryChangeCallback_;
 
     public:
-        QPropertiesWidgetImpl(obs_properties* props, obs_data* p_settings, QWidget* parent)
+        QPropertiesWidgetImpl(OBSPropertiesPtr props, obs_data* p_settings, QWidget* parent)
             : QWidget(parent)
-            , props(props)
+            , props(std::move(props))
             , orig_settings(p_settings)
         {
             obs_data_release(p_settings);
@@ -311,15 +317,17 @@ namespace {
 
             obs_data_apply(settings, orig_settings);
 
-            obs_properties_apply_settings(props, settings);
+            obs_properties_apply_settings(props.get(), settings);
             
             UpdateUI();
         }
 
         ~QPropertiesWidgetImpl()
         {
-            if (props)
-                obs_properties_destroy(props);
+            // Deleting the child controls can trigger focus-out handlers that
+            // call back into UpdateUI(). Block those while we are tearing
+            // the widget down.
+            isUpdating = true;
         }
 
         void SetGeometryChangeCallback(std::function<void()> callback) override {
@@ -345,7 +353,7 @@ namespace {
             layout->setColumnStretch(1, 1);
             layout->setContentsMargins(0, 0, 0, 0);
             layout->setSizeConstraint(QLayout::SetMinAndMaxSize);
-            auto x = obs_properties_first(props);
+            auto x = obs_properties_first(props.get());
             int currow = 0;
             do {
                 if (obs_property_visible(x) == false)
@@ -386,7 +394,7 @@ namespace {
                 x.second->SaveData(settings);
             }
 
-            obs_properties_apply_settings(props, settings);
+            obs_properties_apply_settings(props.get(), settings);
             LoadProperties();
 
             for(auto& x: propwids)
@@ -412,6 +420,6 @@ namespace {
 };
 
 
-QPropertiesWidget* createPropertyWidget(obs_properties* props, obs_data* settings, QWidget* parent) {
-    return new QPropertiesWidgetImpl(props, settings, parent);
+QPropertiesWidget* createPropertyWidget(OBSPropertiesPtr props, obs_data* settings, QWidget* parent) {
+    return new QPropertiesWidgetImpl(std::move(props), settings, parent);
 }
